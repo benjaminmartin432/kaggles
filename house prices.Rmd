@@ -12,7 +12,7 @@ These are the required packages for this exploration. The code should run and
 install packages if they are not installed on the local device
 
 ```{r}
-requiredPackages = c('here', 'tidyverse', 'dplyr', 'data.table', 'ggplot2', 'rstatix', 'missForest', 'Metrics', 'glmnet', 'xgboost', 'mice', 'furrr', 'ufs', 'forcats')
+requiredPackages = c('here', 'tidyverse', 'dplyr', 'data.table', 'ggplot2', 'rstatix', 'missForest', 'Metrics', 'glmnet', 'xgboost', 'mice', 'furrr', 'ufs', 'forcats', 'randomForest', 'future.apply', 'recipes', 'caret', 'broom', 'DescTools', 'infotheo', 'tibble')
 for (p in requiredPackages){
   if(!require(p,character.only = TRUE)) install.packages(p)
   library(p, character.only = TRUE)}
@@ -53,10 +53,10 @@ train_csv %>% count(FireplaceQu)
 ```
 Missing values in FireplaceQu correspond to the property not having a fireplace, and we can impute missing values here easily. We will insert a new category to show that the properties do not have a fireplace. Imputing the missing values in other fields is similar in that we are assuming a missing value indicates the feature not being present on the property. This system applies similarly to the missing values in the fields about basements, masonry, and garages, although we will use a slightly different approach for those fields.
 
-Note that there is one entry here 
+Note that there are two entries here in the basement field where information is missing for in just one basement field (BsmtExposure and BsmtFinType2) and not the other basement fields, which will be imputed by other methods.
 
 ```{r}
-missing_cols_categorical <- c('FireplaceQu', 'Alley', 'PoolQC', 'Fence', 'MiscFeature', 'MasVnrType', 'BsmtQual', 'BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2', 'GarageQual', 'GarageFinish', 'GarageCond', 'GarageType')
+missing_cols_categorical <- c('FireplaceQu', 'Alley', 'PoolQC', 'Fence', 'MiscFeature', 'MasVnrType', 'GarageQual', 'GarageFinish', 'GarageCond', 'GarageType')
 missing_cols_numerical <- c('MasVnrArea', 'GarageYrBlt')
 for (col in missing_cols_categorical){
   train_csv[[col]][is.na(train_csv[[col]])] <- 'Missing'
@@ -64,6 +64,10 @@ for (col in missing_cols_categorical){
 for (col in missing_cols_numerical){
   train_csv[[col]][is.na(train_csv[[col]])] <- 0
 }
+
+bsmt_cols <- c('BsmtQual', 'BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2')
+all_missing <- apply(train_csv[, bsmt_cols], 1, function(row) all(is.na(row)))
+train_csv[all_missing, bsmt_cols] <- 'Missing'
 ```
 Before we start imputing values for variables which are missing data, like LotFrontage, and those associated with other house features, we'll need to further examine other features in the data.
 
@@ -75,7 +79,7 @@ train_csv$YrSold = as.factor(train_csv$YrSold)
 train_csv$MSSubClass = as.factor(train_csv$MSSubClass)
 ```
 
-This brings up another problem, some of the categorical variables in the dataset are ordinal and some are nominal, and they should be encoded as such to avoid problems further down the imputation pipeline. 
+This brings up another problem, some of the categorical variables in the dataset are ordinal and some are nominal, and they should be encoded as such to avoid problems further down the imputation pipeline. Some features (BsmtFinType2, BsmtExposure) have missing data that will be imputed so we will classify them as ordered after the imputation.
 
 ```{r}
 #First, make everything that's text into a factor
@@ -92,14 +96,12 @@ for (var in ordinal_vars){
   train_csv[[var]] <- factor(train_csv[[var]], levels = quality_levels, ordered = TRUE) 
 }
 
-BsmtExposure_levels <- c('Missing', 'No', 'Mn', 'Av', 'Gd')
-train_csv$BsmtExposure <- factor(train_csv$BsmtExposure, levels = BsmtExposure_levels, ordered = TRUE)
+#These are the other ordinal variables with their unique scales
 BsmtFinType_levels <- c('Missing', 'Unf', 'LwQ', 'Rec', 'BLQ', 'ALQ', 'GLQ')
 train_csv$BsmtFinType1 <- factor(train_csv$BsmtFinType1, levels = BsmtFinType_levels, ordered = TRUE)
-train_csv$BsmtFinType2 <- factor(train_csv$BsmtFinType2, levels = BsmtFinType_levels, ordered = TRUE)
 Functional_levels <- c('Sal','Sev', 'Maj2', 'Maj1', 'Mod', 'Min2', 'Min1', 'Typ')
 train_csv$Functional <- factor(train_csv$Functional, levels = Functional_levels, ordered = TRUE)
-GarageFinish_levels <- c('Missing', 'Unf', 'Rfn', 'Fin')
+GarageFinish_levels <- c('Missing', 'Unf', 'RFn', 'Fin')
 train_csv$GarageFinish <- factor(train_csv$GarageFinish, levels = GarageFinish_levels, ordered = TRUE)
 Fence_levels <- c('Missing', 'MnWw', 'GdWo', 'MnPrv', 'GdPrv')
 train_csv$Fence <- factor(train_csv$Fence, levels = Fence_levels, ordered = TRUE)
@@ -109,199 +111,358 @@ Paved_levels <- c('N', 'P', 'Y')
 train_csv$PavedDrive <- factor(train_csv$PavedDrive, levels = Paved_levels, ordered = TRUE)
 ```
 
-THINGS NEEDING TO BE DONE: 
-IMPUTE ELECTRICAL (KNN SHOULD BE FINE FOR THIS)
-IMPUTE LOTFRONTAGE
-EXAMINE THINGS FOR SKEWING
+Before we go ahead and predict our missing values, we'll first try and examine the variables in the dataset and see which variables are strongly associated or un-associated with our outcome variables. We'll use Cramers V test for categorical variables and ANOVA tests for numerical variables.
+
 
 ```{r}
-set.seed(123)
-
-#---------------------------------
-# Parameters
-#---------------------------------
-df <- train_csv
-target_var <- "Electrical"
-folds <- 5
-
-#---------------------------------
-# Data cleaning and setup
-#---------------------------------
-df_known <- df %>% filter(!is.na(.data[[target_var]]))
-df_known[[target_var]] <- droplevels(df_known[[target_var]])
-
-# Drop near-zero variance and fully missing columns
-nzv <- sapply(df_known, function(x) length(unique(na.omit(x))) <= 1)
-df_known <- df_known[, !nzv, drop = FALSE]
-
-# Remove highly correlated numeric predictors (cutoff = 0.999)
-num_vars <- sapply(df_known, is.numeric)
-num_cols <- names(df_known)[num_vars]
-
-if (length(num_cols) > 1) {
-  corr_mat <- cor(df_known[, num_cols], use = "pairwise.complete.obs")
-  high_corr <- which(abs(corr_mat) > 0.999 & upper.tri(corr_mat), arr.ind = TRUE)
-  # Keep only the first column of each correlated pair
-  to_remove <- unique(num_cols[high_corr[,2]])
-  if (length(to_remove) > 0) {
-    df_known <- df_known[, !names(df_known) %in% to_remove]
-    cat("Dropped highly correlated numeric predictors:", paste(to_remove, collapse = ", "), "\n")
+feature_usefulness <- function(df, target_var) {
+  target <- df[[target_var]]
+  
+  # Drop NAs in target for association calculation
+  df <- df[!is.na(target), ]
+  target <- droplevels(df[[target_var]])
+  
+  results <- data.frame(
+    Variable = character(),
+    Type = character(),
+    Measure = character(),
+    Value = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (v in setdiff(names(df), target_var)) {
+    # Skip variables that are entirely missing or constant
+    if (all(is.na(df[[v]])) || length(unique(df[[v]])) < 2) next
+    
+    if (is.factor(df[[v]])) {
+      # 🟦 Categorical predictor — use Cramér’s V
+      tbl <- table(df[[v]], target)
+      val <- tryCatch(DescTools::CramerV(tbl, bias.correct = TRUE), error = function(e) NA)
+      results <- rbind(results, data.frame(Variable = v, Type = "Categorical", Measure = "CramerV", Value = val))
+      
+    } else if (is.numeric(df[[v]])) {
+      # 🟩 Numeric predictor — use correlation ratio (η²)
+      formula <- as.formula(paste(v, "~", target_var))
+      val <- tryCatch({
+        model <- aov(formula, data = df)
+        summary(model)[[1]][["Sum Sq"]][1] / sum(summary(model)[[1]][["Sum Sq"]])
+      }, error = function(e) NA)
+      results <- rbind(results, data.frame(Variable = v, Type = "Numeric", Measure = "EtaSquared", Value = val))
+    }
   }
-}
-
-predictors <- setdiff(names(df_known), target_var)
-folds_idx <- sample(rep(1:folds, length.out = nrow(df_known)))
-
-calc_acc <- function(true, pred) {
-  true <- droplevels(true)
-  pred <- factor(pred, levels = levels(true))
-  mean(true == pred, na.rm = TRUE)
-}
-
-#---------------------------------
-# Helper: prepare data for glmnet/xgboost
-#---------------------------------
-prepare_matrix <- function(train_data, test_data, target) {
-  # Create model matrix
-  x_train <- model.matrix(as.formula(paste(target, "~ .")), data = train_data)[, -1]
-  x_test <- model.matrix(as.formula(paste(target, "~ .")), data = test_data)[, -1]
   
-  y_train <- as.numeric(train_data[[target]])
-  y_test <- as.numeric(test_data[[target]])
+  results <- results %>%
+    arrange(desc(Value))
   
-  list(x_train = x_train, y_train = y_train, x_test = x_test, y_test = y_test)
+  return(results)
 }
 
-#---------------------------------
-# Helper: single fold evaluation
-#---------------------------------
-run_fold <- function(train_data, test_data, true_values) {
-  fold_results <- list()
-
-  # 1. Mode Imputation
-  mode_value <- names(sort(table(train_data[[target_var]]), decreasing = TRUE))[1]
-  pred_mode <- rep(mode_value, length(true_values))
-  acc_mode <- calc_acc(true_values, pred_mode)
-
-  # 2. Random Forest (no caret)
-  suppressWarnings({
-    rf_model <- randomForest::randomForest(
-      as.formula(paste(target_var, "~ .")),
-      data = train_data,
-      ntree = 100,
-      na.action = na.roughfix
-    )
-    rf_pred <- predict(rf_model, newdata = test_data)
-  })
-  acc_rf <- calc_acc(true_values, rf_pred)
-
-  # 3. Elastic Net (glmnet, multinomial)
-  data_glm <- prepare_matrix(train_data, test_data, target_var)
-  cv_glm <- cv.glmnet(data_glm$x_train, factor(data_glm$y_train),
-                      family = "multinomial", type.measure = "class", alpha = 0.5)
-  pred_glm <- predict(cv_glm, newx = data_glm$x_test, s = "lambda.min", type = "class")
-  acc_glm <- calc_acc(true_values, factor(levels(train_data[[target_var]])[pred_glm]))
-
-  # 4. XGBoost
-  label_train <- as.numeric(train_data[[target_var]]) - 1
-  label_test <- as.numeric(test_data[[target_var]]) - 1
-  dtrain <- xgb.DMatrix(data = data_glm$x_train, label = label_train)
-  dtest <- xgb.DMatrix(data = data_glm$x_test, label = label_test)
-
-  xgb_model <- xgboost(
-    data = dtrain,
-    objective = "multi:softmax",
-    num_class = length(unique(label_train)),
-    nrounds = 100,
-    verbose = 0,
-    eta = 0.1,
-    max_depth = 4
-  )
-  xgb_pred <- predict(xgb_model, dtest)
-  acc_xgb <- calc_acc(true_values, factor(levels(train_data[[target_var]])[xgb_pred + 1]))
-
-  # 5. missForest
-  mf_df <- test_data
-  mf_df[[target_var]] <- NA
-  comb_df <- bind_rows(train_data, mf_df)
-  mf_out <- tryCatch(
-    missForest(comb_df, maxiter = 5, ntree = 50, verbose = FALSE),
-    error = function(e) NULL
-  )
-  if (!is.null(mf_out)) {
-    mf_pred <- mf_out$ximp[[target_var]][(nrow(train_data) + 1):nrow(comb_df)]
-    acc_mf <- calc_acc(true_values, mf_pred)
-  } else acc_mf <- NA
-
-  # 6. MICE
-  mice_df <- bind_rows(train_data, test_data)
-  mice_df[[target_var]][(nrow(train_data) + 1):nrow(mice_df)] <- NA
-  mice_imp <- tryCatch(
-    mice(mice_df, m = 1, maxit = 5, method = "pmm", printFlag = FALSE),
-    error = function(e) NULL
-  )
-  if (!is.null(mice_imp)) {
-    mice_complete <- complete(mice_imp)
-    mice_pred <- mice_complete[[target_var]][(nrow(train_data) + 1):nrow(mice_complete)]
-    acc_mice <- calc_acc(true_values, mice_pred)
-  } else acc_mice <- NA
-
-  tibble(
-    Method = c("Mode", "Random Forest", "Elastic Net", "XGBoost", "missForest", "MICE"),
-    Accuracy = c(acc_mode, acc_rf, acc_glm, acc_xgb, acc_mf, acc_mice)
-  )
-}
-
-#---------------------------------
-# Cross-validation loop
-#---------------------------------
-results_all <- list()
-for (i in seq_len(folds)) {
-  cat("Running fold", i, "of", folds, "\n")
-  train_data <- df_known[folds_idx != i, ]
-  test_data <- df_known[folds_idx == i, ]
-  true_values <- test_data[[target_var]]
-
-  fold_res <- run_fold(train_data, test_data, true_values)
-  fold_res$Fold <- i
-  results_all[[i]] <- fold_res
-}
-
-results_all_df <- bind_rows(results_all)
-
-#---------------------------------
-# Summarize + Plot
-#---------------------------------
-summary_results <- results_all_df %>%
-  group_by(Method) %>%
-  summarise(
-    Mean_Accuracy = mean(Accuracy, na.rm = TRUE),
-    SD_Accuracy = sd(Accuracy, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-print(summary_results)
-
-ggplot(summary_results, aes(x = Method, y = Mean_Accuracy, fill = Method)) +
-  geom_col(show.legend = FALSE) +
-  geom_errorbar(aes(ymin = Mean_Accuracy - SD_Accuracy, ymax = Mean_Accuracy + SD_Accuracy), width = 0.2) +
-  geom_text(aes(label = sprintf("%.2f", Mean_Accuracy)), vjust = -0.4, size = 4) +
-  theme_minimal() +
-  labs(
-    title = paste("Cross-Validated Accuracy for Imputation of", target_var),
-    y = "Mean Accuracy (± SD)",
-    x = ""
-  )
+usefulness_tbl <- feature_usefulness(train_csv, target_var = "BsmtExposure")
+significant_predictors <- usefulness_tbl %>%
+  filter((Measure == "CramerV" & Value > 0.1) |
+         (Measure == "EtaSquared" & Value > 0.05))
 ```
+THINGS NEEDING TO BE DONE: 
+IMPUTE LOTFRONTAGE
+SCALE/CENTRE FEATURES THAT NEED TO BE SCALED
 
+Now that we've got most of the missing categorical data appropriately assigned and imputed, we need to deal with the remaining missing values. Accomplishing this task will involve testing different methods to see which method provides the best results for imputation, as assessed by different methods (Accuracy of predictions, F1 Score). This function does several things that I'll describe briefly. First, there are a few safety checks that are completed as we select our significantly associated predictors (although this step is really more about removing very unassociated predictors), before a masked set of data is taken from the dataset and used to split the data into training / testing. We impute the values missing from the categories not being tested for (at this point LotFrontage, and the other categorical variables that are being imputed).Then with our cleaned data, we predict! As a baseline, we're using the mode values from the category as the outcome, which given the group sizes in these categories isn't a very bad idea. For two comparison methods, we'll use kNN and Random Forest classification models.
 
 ```{r}
-na_count_test
-```
-Missing data is present in the MSZoning, LotFrontage, Alley, Utilities, Exterior1st, Exterior2nd, MasVnrType, MasVnrArea, BsmtQual, BsmtCond, BsmtExposure, BsmtFinType1, BsmtFinSF1, BsmtFinType2, BsmtFinSF2, BsmtUnfSF, TotalBsmtSF, BsmtFullBath, BsmtHalfBath, KitchenQual, Functional, FireplaceQu, GarageType, GarageYrBlt, GarageFinish, GarageCars, GarageArea, GarageQual, GarageCond, PoolQC, Fence, MiscFeature, SaleType
-We will need to do further investigation into the data before we can decide if we will how to deal with these missing values
+evaluate_categorical_imputation <- function(df,
+                                            target_var,
+                                            predictor_vars = NULL,
+                                            mask_frac = 0.20,
+                                            k_knn = 5,
+                                            rf_ntree = 200,
+                                            seed = 123,
+                                            max_predictor_missing_frac = 0.5) {
+  set.seed(seed)
+  if (!target_var %in% names(df)) stop("target_var not found in dataframe")
+  # ensure target is factor
+  if (!is.factor(df[[target_var]])) df[[target_var]] <- as.factor(df[[target_var]])
+  
+  results_tbl <- feature_usefulness(train_csv, target_var = target_var)
+  significant_predictors <- results_tbl %>%
+  filter((Measure == "CramerV" & Value > 0.1) |
+         (Measure == "EtaSquared" & Value > 0.05))
+  
+  
+  # choose predictors if not provided: all columns except target
+  if (is.null(predictor_vars)) {
+    predictor_vars <- significant_predictors$Variable
+  }
+  
+  # Filter out predictors that are almost entirely missing
+  predictor_missing_frac <- sapply(df[predictor_vars], function(x) mean(is.na(x)))
+  keep_preds <- names(predictor_missing_frac)[predictor_missing_frac <= max_predictor_missing_frac]
+  if (length(keep_preds) == 0) stop("No predictors with acceptable missingness found")
+  predictor_vars <- keep_preds
+  
+  # Split known / missing target rows
+  known_idx <- which(!is.na(df[[target_var]]))
+  missing_target_idx <- which(is.na(df[[target_var]]))
+  if (length(known_idx) < 10) stop("Too few known target rows to evaluate reliably")
+  
+  # Mask a random subset of known targets for evaluation
+  mask_n <- max(1, round(length(known_idx) * mask_frac))
+  mask_idx <- sample(known_idx, mask_n)
+  df_masked <- df
+  true_values <- df[[target_var]][mask_idx]
+  df_masked[[target_var]][mask_idx] <- NA
+  
+  # Build training and testframes:
+  # training rows = rows with target known (after masking)
+  train_df <- df_masked %>% filter(!is.na(.data[[target_var]])) %>% select(all_of(c(target_var, predictor_vars)))
+  test_df  <- df_masked[mask_idx, , drop = FALSE] %>% select(all_of(c(target_var, predictor_vars)))
+  
+  # Apply simple imputation to predictors using only training distribution for numerics:
+  # For numeric medians we compute medians on training data and apply to both train/test,
+  # For categorical we map NAs to "Missing".
+  # Compute numeric medians from training.
+  numeric_preds <- predictor_vars[sapply(train_df[predictor_vars], is.numeric)]
+  medians <- sapply(train_df[numeric_preds], function(x) median(x, na.rm = TRUE))
+  for (col in numeric_preds){
+  train_df[[col]][is.na(train_df[[col]])] <- medians[[col]]
+  test_df[[col]][is.na(test_df[[col]])] <- medians[[col]]
+  }
+  
+  factor_preds <- setdiff(predictor_vars, numeric_preds)
+  for (col in factor_preds){
+    if(NA %in% train_df[[col]]){
+      levs <- c(levels(train_df[[col]]), 'MissingVal')
+      train_df[[col]] <- factor(train_df[[col]], levels = levs)
+      test_df[[col]] <- factor(test_df[[col]], levels = levs)
+    }
+    train_df[[col]][is.na(train_df[[col]])] <- 'MissingVal'
+  
+    if(NA %in% test_df[[col]]){
+      levs <- c(levels(test_df[[col]]), 'MissingVal')
+      train_df[[col]] <- factor(train_df[[col]], levels = levs)
+      test_df[[col]] <- factor(test_df[[col]], levels = levs)
+    }
+    test_df[[col]][is.na(test_df[[col]])] <- 'MissingVal'
+  }
+  
+  # If medians are NA (all missing), set to 0
+  medians[is.na(medians)] <- 0
+  
+  # Ensure target in train is factor and levels set
+  train_df[[target_var]] <- factor(train_df[[target_var]])
+  target_levels <- levels(train_df[[target_var]])
+  
+  # ---- 1) Baseline: Mode ----
+  mode_value <- names(sort(table(train_df[[target_var]]), decreasing = TRUE))[1]
+  pred_mode <- factor(rep(mode_value, nrow(test_df)), levels = target_levels)
+  acc_mode <- mean(pred_mode == true_values, na.rm = TRUE)
+  conf_mode <- table(Predicted = pred_mode, True = true_values)
+  
+  # ---- 2) kNN ----
+  # Build dummy variables using model.matrix on combined train+test so columns match
+  combined_preds <- bind_rows(
+    train_df %>% select(all_of(predictor_vars)),
+    test_df %>% select(all_of(predictor_vars))
+  )
+  # model.matrix: produce numeric matrix; uses training-level factors aligned via levels we set earlier
+  mm <- model.matrix(~ . - 1, data = combined_preds)  # no intercept, all predictors
+  # split back
+  ntr <- nrow(train_df)
+  train_mat <- mm[1:ntr, , drop = FALSE]
+  test_mat  <- mm[(ntr + 1):nrow(mm), , drop = FALSE]
+  
+  # scale numeric columns using training means/sds to make kNN distance meaningful
+  # identify numeric columns by checking which columns correspond to original numeric preds
+  # safe approach: scale all columns (mean/sd from train) — if sd=0, set sd=1
+  col_means <- colMeans(train_mat, na.rm = TRUE)
+  col_sds   <- apply(train_mat, 2, sd, na.rm = TRUE)
+  col_sds[col_sds == 0 | is.na(col_sds)] <- 1
+  train_mat_scaled <- sweep(sweep(train_mat, 2, col_means, "-"), 2, col_sds, "/")
+  test_mat_scaled  <- sweep(sweep(test_mat, 2, col_means, "-"), 2, col_sds, "/")
+  
+  
+  if (nrow(train_mat_scaled) < 1 || nrow(test_mat_scaled) < 1) {
+    warning("kNN: not enough data after filtering; returning NA for kNN")
+    pred_knn <- rep(NA, length(true_values))
+    acc_knn <- NA
+    conf_knn <- NULL
+  } else {
+    k_used <- min(k_knn, nrow(train_mat_scaled))
+    pred_knn_raw <- class::knn(train = train_mat_scaled, test = test_mat_scaled, cl = train_df[[target_var]], k = k_used)
+    # place predictions back into full masked size (some rows may have been dropped if non-finite)
+    pred_knn <- factor(pred_knn_raw, levels = target_levels)
+    acc_knn <- mean(pred_knn == true_values, na.rm = TRUE)
+    conf_knn <- table(Predicted = pred_knn, True = true_values)
+  }
+  
+  # ---- 3) Random forest ----
+  # Train randomForest on train_df, predict on test_df
+  rf_model <- tryCatch({
+    randomForest::randomForest(as.formula(paste(target_var, "~ .")), data = train_df, ntree = rf_ntree)
+  }, error = function(e) {
+    warning("randomForest failed: ", e$message)
+    NULL
+  })
+  if (is.null(rf_model)) {
+    pred_rf <- rep(NA, nrow(test_df))
+    acc_rf <- NA
+    conf_rf <- NULL
+  } else {
+    pred_rf_raw <- predict(rf_model, newdata = test_df)
+    pred_rf <- factor(pred_rf_raw, levels = target_levels)
+    acc_rf <- mean(pred_rf == true_values, na.rm = TRUE)
+    conf_rf <- table(Predicted = pred_rf, True = true_values)
+  }
+  
+  compute_precision_recall <- function(true, pred) {
+  # Ensure both are factors with same levels
+  true <- factor(true)
+  pred <- factor(pred, levels = levels(true))
+  
+  cm <- caret::confusionMatrix(pred, true)
+  precision <- mean(cm$byClass[, "Precision"], na.rm = TRUE)
+  recall <- mean(cm$byClass[, "Recall"], na.rm = TRUE)
+  
+  return(list(precision = precision, recall = recall))
+  }
+  
+  pr_mode <- compute_precision_recall(true_values, pred_mode)
+  f1_mode <- f1(true_values, pred_mode)
+  pr_knn  <- compute_precision_recall(true_values, pred_knn)
+  f1_knn <- f1(true_values, pred_knn)
+  pr_rf   <- compute_precision_recall(true_values, pred_rf)
+  f1_rf <- f1(true_values, pred_rf)
+  
+  # Compose summary results
+  summary_tbl <- tibble::tibble(
+    Method = c("Mode", paste0("kNN (k=", k_knn, ")"), "RandomForest"),
+    Accuracy = c(acc_mode, acc_knn, acc_rf),
+    Precision = c(pr_mode$precision, pr_knn$precision, pr_rf$precision),
+    Recall = c(pr_mode$recall, pr_knn$recall, pr_rf$recall),
+    F1_score = c(f1_mode, f1_knn, f1_rf),
+    N_test = nrow(test_df)
+  )
+  
+  # Return details
+  return(list(
+    summary = summary_tbl,
+    confusion = list(mode = conf_mode, knn = conf_knn, rf = conf_rf),
+    true_values = true_values,
+    preds = tibble(
+      row_in_original = mask_idx,
+      true = true_values,
+      pred_mode = pred_mode,
+      pred_knn = pred_knn,
+      pred_rf = pred_rf
+    ),
+    models = list(rf_model = rf_model),
+    train_info = list(n_train = nrow(train_df), predictors = predictor_vars)
+  ))
+}
 
-LotFrontage - defined as 'Linear feet of street connected to property'. We will first examine the shape of the variable
+result_BsmtFinType2 <- evaluate_categorical_imputation(train_csv, target_var = "BsmtFinType2",
+                                           predictor_vars = NULL, mask_frac = 0.2,
+                                           k_knn = 15, rf_ntree = 225, seed = 123)
+result_Electrical <- evaluate_categorical_imputation(train_csv, target_var = "Electrical",
+                                           predictor_vars = NULL, mask_frac = 0.2,
+                                           k_knn = 15, rf_ntree = 225, seed = 123)
+result_BsmtExposure <- evaluate_categorical_imputation(train_csv, target_var = "BsmtExposure",
+                                           predictor_vars = NULL, mask_frac = 0.2,
+                                           k_knn = 15, rf_ntree = 225, seed = 123) 
+print(result_BsmtFinType2$summary)
+print(result_Electrical$summary)
+print(result_BsmtExposure$summary)
+```
+Results of the imputation methods show that RandomForest consistently produces the most accurate results, although the differences in accuracy between methods aren't particularly large, which should be expected given the group sizes in these variables. In assessing the actual utility of these methods in assigning correctly, we should instead rely on other methods, such as the F1 score, or the harmonic mean of the models precision and recall. The F1 score also shows that RandomForest consistently produces the best results in terms of correctly assigning True positives / True negative cases, for which the mode and kNN are not as well suited. Knowing this, we'll now use the Random Forest model to impute the missing values from our original training dataset. The below function separates data into known / NA for train / test, and uses the given model (in this case Random Forests, although it could b changed for other methods) to impute the missing values in our original dataset.
+
+```{r}
+impute_categorical_var <- function(df, target_var, method = "rf", k_knn = 5, rf_ntree = 200) {
+  
+  # Identify missing and known rows
+  missing_idx <- which(is.na(df[[target_var]]))
+  known_idx   <- which(!is.na(df[[target_var]]))
+  if (length(missing_idx) == 0) return(list(df = df, imputed = 0))
+  if (length(known_idx) < 10)  return(list(df = df, imputed = 0)) # too few for model training
+  
+  # Select predictors 
+  results_tbl <- feature_usefulness(train_csv, target_var = target_var)
+  significant_predictors <- results_tbl %>%
+  filter((Measure == "CramerV" & Value > 0.1) |
+         (Measure == "EtaSquared" & Value > 0.05))
+  predictors <- significant_predictors$Variable
+  
+  # Filter predictors to remove any with missing values
+  complete_predictors <- predictors[sapply(df[predictors], function(x) all(!is.na(x)))]
+  
+  df_train <- df[known_idx, complete_predictors, drop = FALSE]
+  df_test  <- df[missing_idx, complete_predictors, drop = FALSE]
+  y_train  <- df[known_idx, target_var, drop = TRUE]
+  
+  # Model fitting and prediction
+  preds <- NULL
+  if (method == "mode") {
+    mode_value <- names(sort(table(y_train), decreasing = TRUE))[1]
+    preds <- factor(rep(mode_value, length(missing_idx)), levels = levels(y_train))
+    
+  } else if (method == "knn") {
+    # Encode categoricals
+    combined <- rbind(df_train, df_test)
+    mm <- model.matrix(~ . - 1, data = combined)
+    train_mat <- mm[1:nrow(df_train), , drop = FALSE]
+    test_mat  <- mm[(nrow(df_train)+1):nrow(mm), , drop = FALSE]
+    
+    # Scale numeric columns
+    col_means <- colMeans(train_mat)
+    col_sds <- apply(train_mat, 2, sd)
+    col_sds[col_sds == 0] <- 1
+    train_mat <- sweep(sweep(train_mat, 2, col_means, "-"), 2, col_sds, "/")
+    test_mat  <- sweep(sweep(test_mat, 2, col_means, "-"), 2, col_sds, "/")
+    
+    preds <- knn(train = train_mat, test = test_mat, cl = y_train, k = k_knn)
+    
+  } else if (method == "rf") {
+    rf_model <- randomForest::randomForest(y = y_train, x = df_train, ntree = rf_ntree)
+    preds <- predict(rf_model, newdata = df_test)
+  } 
+  
+  # Replace missing values
+  df[[target_var]][missing_idx] <- preds
+  list(df = df, imputed = length(missing_idx))
+}
+
+impute_all_categorical <- function(df, method, k_knn = 5, rf_ntree = 200) {
+  cat_vars <- names(df)[sapply(df, function(x) is.factor(x))]
+  
+  results <- list()
+  total_imputed <- 0
+  
+  for (var in cat_vars) {
+    if (any(is.na(df[[var]]))) {
+      message("Imputing missing data in ", var, " using method = ", method, " ...")
+      res <- impute_categorical_var(df, target_var = var, method = method,
+                                    k_knn = k_knn, rf_ntree = rf_ntree)
+      df <- res$df
+      total_imputed <- total_imputed + res$imputed
+      results[[var]] <- res$imputed
+    }
+  }
+  
+  message("Imputation complete. Total categorical values imputed: ", total_imputed)
+  return(list(data = df, summary = results))
+}
+result <- impute_all_categorical(train_csv, method = "rf")
+train_csv <- result$data
+```
+
+And remember to assign these as ordinal variables.
+
+```{r}
+train_csv$BsmtFinType2 <- factor(train_csv$BsmtFinType2, levels = BsmtFinType_levels, ordered = TRUE)
+BsmtExposure_levels <- c('Missing', 'No', 'Mn', 'Av', 'Gd')
+train_csv$BsmtExposure <- factor(train_csv$BsmtExposure, levels = BsmtExposure_levels, ordered = TRUE)
+```
+
+Now we're all done with the categorical variables, which brings us to our last variable, the continuous LotFrontage - defined as 'Linear feet of street connected to property'. We will first examine the shape of the variable
+
 ```{r}
 train_density <- density(train_csv$LotFrontage, na.rm = TRUE)
 plot(x= train_density$x, y =train_density$y, main= 'density of lot frontage', xlab = 'value', ylab = 'density')
@@ -309,7 +470,7 @@ boxplot(train_csv$LotFrontage, main= 'boxplot of lot frontage')
 ```
 This data has a long right tail, there are outliers on both ends of the scale here, although there are a lot more large outliers rather than small outliers. This means that it might be difficult for imputing missing values by some measure of centrality in this dataset (i.e. mean or median) would likely lead to inaccuracies and problems further down the line.
 
-Let's check for correlations between the lot frontage and other variables. There are several that I would expect that have some correlation, including lot shape, lot area, building type, and variables related to the garage (although there's a small number of entries with missing value for the garage (~5%), so we may need to come back to this imputation later)
+Let's check for correlations between the lot frontage and other variables. There are several that I would expect that have some correlation, including lot shape, lot area, building type, and variables related to the size of the property, but specifically those related to the garage.
 ```{r}
 num_cols <- sapply(train_csv, is.numeric)
 cor_results <- cor(train_csv$LotFrontage, train_csv[num_cols], method = 'pearson', use = 'complete.obs')
@@ -319,15 +480,47 @@ cor_results <- cor_results[order(-abs(cor_results$Freq)), ]
 top_11 <- head(cor_results, 11)
 top_11[2:11,2:3]
 ```
-The top 10 variables that relate to lot frontage are the area of the first floor, the lot area, the living area, basement area, zoning subclass, garage area, total rooms above ground, sale price (not useful for us here), the number of cars that can fit in the garage, and the number of bedrooms above ground. This can broadly be interpreted as a larger house (i.e. one with more area in the total lot, more living area, more garage area, rooms above ground) can be correlated with an increase in lot frontage
+The top 10 variables that relate to lot frontage are the area of the first floor, the lot area, the living area, basement area, zoning subclass, garage area, total rooms above ground, sale price (not useful for us here as we'll also have to impute this in our test data where we won't have access to this variable), the number of cars that can fit in the garage, and the number of bedrooms above ground. This can broadly be interpreted as a larger house (i.e. one with more area in the total lot, more living area, more garage area, rooms above ground) can be correlated with an increase in lot frontage
 
 We'll now try and evaluate the links between the other non-numerical variables and lot frontage. We'll first convert the character variables to factors, which they broadly are, and then conduct ANOVA or t-tests to evaluate whether the means of the groups differ by a significant amount.
+
 ```{r}
-factor_vars <- lapply(train_csv, is.factor)
-anova_results <- aov(LotFrontage ~ MSZoning, data = train_csv)
-summary(anova_results)
-TukeyHSD(anova_results)
+factor_vars <-names(train_csv)[sapply(train_csv, is.factor)]
+results_table <- tibble(
+  Variable = var,
+  F_value = summary(anova_results)[1][[1]]$`F value`[1],
+  P_value = summary(anova_results)[[1]]$`Pr(>F)`[1]
+)
+for (var in factor_vars) {
+  data <- train_csv[[var]]
+  if (length(unique(data)) > 2){
+    formula <- as.formula(paste("LotFrontage ~", var))
+    anova_results <- aov(formula, data = train_csv)
+  #print(anova_results)
+    results_table <- results_table %>%
+      add_row(Variable = var, F_value = summary(anova_results)[1][[1]]$`F value`[1], P_value = summary(anova_results)[[1]]$`Pr(>F)`[1])
+  }
+  else{
+    group_sizes <- table(train_csv[[var]])
+    if (any(group_sizes==1)){
+      cat(var, "skipped, not enough observations")
+      next}
+    else{
+      formula <- as.formula(paste("LotFrontage ~", var))
+      test <- t.test(formula, data = train_csv)
+      results_table <- results_table %>%
+        add_row(Variable = var, F_value = test$statistic, P_value = test$p.value)
+    }
+  }
+}
+
+result<- results_table %>% arrange(P_value)
+print(result)
+#summary(anova_results)
+#TukeyHSD(anova_results)
 ```
+
+
 
 ```{r}
 # Identify all factor columns (excluding LotFrontage)
@@ -498,7 +691,7 @@ anova_summary <- check_anova_assumptions_adjusted(
   cat_vars = cat_vars,
   alpha = 0.05,
   adjust_method = "BH",  # or "bonferroni"
-  make_plots = FALSE
+  make_plots = TRUE
 )
 
 head(anova_summary)
@@ -909,3 +1102,9 @@ best_by_method <- results_all %>%
   ungroup()
 print(best_by_method)
 ```
+
+```{r}
+na_count_test
+```
+Missing data is present in the MSZoning, LotFrontage, Alley, Utilities, Exterior1st, Exterior2nd, MasVnrType, MasVnrArea, BsmtQual, BsmtCond, BsmtExposure, BsmtFinType1, BsmtFinSF1, BsmtFinType2, BsmtFinSF2, BsmtUnfSF, TotalBsmtSF, BsmtFullBath, BsmtHalfBath, KitchenQual, Functional, FireplaceQu, GarageType, GarageYrBlt, GarageFinish, GarageCars, GarageArea, GarageQual, GarageCond, PoolQC, Fence, MiscFeature, SaleType
+We will use broadly the same methods as used in the training dataset to impute the missing values in the test dataset.
