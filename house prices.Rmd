@@ -12,7 +12,7 @@ These are the required packages for this exploration. The code should run and
 install packages if they are not installed on the local device
 
 ```{r}
-requiredPackages = c('here', 'tidyverse', 'dplyr', 'data.table', 'ggplot2', 'rstatix', 'missForest', 'Metrics', 'glmnet', 'xgboost', 'mice', 'furrr', 'ufs')
+requiredPackages = c('here', 'tidyverse', 'dplyr', 'data.table', 'ggplot2', 'rstatix', 'missForest', 'Metrics', 'glmnet', 'xgboost', 'mice', 'furrr', 'ufs', 'forcats', 'randomForest', 'future.apply', 'recipes', 'caret', 'broom', 'DescTools', 'infotheo', 'tibble', 'car', 'stats', 'poolr', 'keras', 'tensorflow', 'yardstick', 'h2o', 'ranger', 'lightgbm', 'Matrix')
 for (p in requiredPackages){
   if(!require(p,character.only = TRUE)) install.packages(p)
   library(p, character.only = TRUE)}
@@ -51,38 +51,415 @@ train_csv %>% count(Fence)
 train_csv %>% count(MiscFeature)
 train_csv %>% count(FireplaceQu)
 ```
-Missing values in FireplaceQu correspond to the property not having a fireplace, and we can impute missing values here easily. We will insert a new category to show that the properties do not have a fireplace. We can use a similar approach with the Alley variable, although this is an assumption that all other entries with missing values are also missing access to an alley. Imputing the missing values in other fields is much less clear, and in further analysis PoolQC and Fence will be removed. MiscFeature is related to the field MiscVal, so while we will be removing MiscFeature, the information in it will be retained through the MiscVal column.
+Missing values in FireplaceQu correspond to the property not having a fireplace, and we can impute missing values here easily. We will insert a new category to show that the properties do not have a fireplace. Imputing the missing values in other fields is similar in that we are assuming a missing value indicates the feature not being present on the property. This system applies similarly to the missing values in the fields about basements, masonry, and garages, although we will use a slightly different approach for those fields.
+
+Note that there are two entries here in the basement field where information is missing for in just one basement field (BsmtExposure and BsmtFinType2) and not the other basement fields, which will be imputed by other methods.
 
 ```{r}
-train_csv <- train_csv %>% select(-PoolQC, -Fence, -MiscFeature)
-train_csv$FireplaceQu = train_csv$FireplaceQu.fillna('NoFireplace')
-train_csv$Alley = train_csv$Alley.fillna('NoAlley')
+missing_cols_categorical <- c('FireplaceQu', 'Alley', 'PoolQC', 'Fence', 'MiscFeature', 'MasVnrType', 'GarageQual', 'GarageFinish', 'GarageCond', 'GarageType')
+missing_cols_numerical <- c('MasVnrArea', 'GarageYrBlt')
+for (col in missing_cols_categorical){
+  train_csv[[col]][is.na(train_csv[[col]])] <- 'Missing'
+}
+for (col in missing_cols_numerical){
+  train_csv[[col]][is.na(train_csv[[col]])] <- 0
+}
+
+bsmt_cols <- c('BsmtQual', 'BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2')
+all_missing <- apply(train_csv[, bsmt_cols], 1, function(row) all(is.na(row)))
+train_csv[all_missing, bsmt_cols] <- 'Missing'
 ```
 Before we start imputing values for variables which are missing data, like LotFrontage, and those associated with other house features, we'll need to further examine other features in the data.
 
-Some variables are listed as numerical, but are in fact categorical and should be treated as such. These include the month that the property was sold (MoSold), the year the property was sold (YrSold) and the Subclass of the building (MsSubClass). These are nominal variables, where order does not imply any difference.
+Some variables are listed as numerical, but are in fact categorical and should be treated as such. These include the month that the property was sold (MoSold), the year the property was sold (YrSold) and the Subclass of the building (MSSubClass).
 
 ```{r}
 train_csv$MoSold = as.factor(train_csv$MoSold)
 train_csv$YrSold = as.factor(train_csv$YrSold)
-train_csv$MsSubClass = as.factor(train_csv$MSSubClass)
+train_csv$MSSubClass = as.factor(train_csv$MSSubClass)
 ```
 
-THINGS NEEDING TO BE DONE: 
-IMPUTE ELECTRICAL (KNN SHOULD BE FINE FOR THIS)
-IMPUTE MISSING MASONRY VALUES
-IMPUTE MISSING BASEMENT VALUES
-IMPUTE MISSING GARAGE VALUES
-EXAMINE THINGS FOR SKEWING
+This brings up another problem, some of the categorical variables in the dataset are ordinal and some are nominal, and they should be encoded as such to avoid problems further down the imputation pipeline. Some features (BsmtFinType2, BsmtExposure) have missing data that will be imputed so we will classify them as ordered after the imputation.
+
+```{r}
+#First, make everything that's text into a factor
+character_cols <- lapply(train_csv, class) == 'character'
+train_csv[,character_cols] <- lapply(train_csv[,character_cols], as.factor)
+
+#Next, make sure that everything that has a scale (i.e. factors that are ordinal) has that scale defined in order
+factor_vars <- lapply(train_csv, class) == 'factor'
+
+#These are the ordinal factors that use the same scale, the other 7 need to be set individually
+ordinal_vars <- c('ExterQual', 'ExterCond', 'BsmtQual', 'BsmtCond', 'HeatingQC', 'KitchenQual', 'FireplaceQu', 'GarageQual', 'GarageCond', 'PoolQC')                      
+quality_levels <- c('Missing', 'Po', 'Fa', 'TA', 'Gd', 'Ex')
+for (var in ordinal_vars){
+  train_csv[[var]] <- factor(train_csv[[var]], levels = quality_levels, ordered = TRUE) 
+}
+
+#These are the other ordinal variables with their unique scales
+BsmtFinType_levels <- c('Missing', 'Unf', 'LwQ', 'Rec', 'BLQ', 'ALQ', 'GLQ')
+train_csv$BsmtFinType1 <- factor(train_csv$BsmtFinType1, levels = BsmtFinType_levels, ordered = TRUE)
+Functional_levels <- c('Sal','Sev', 'Maj2', 'Maj1', 'Mod', 'Min2', 'Min1', 'Typ')
+train_csv$Functional <- factor(train_csv$Functional, levels = Functional_levels, ordered = TRUE)
+GarageFinish_levels <- c('Missing', 'Unf', 'RFn', 'Fin')
+train_csv$GarageFinish <- factor(train_csv$GarageFinish, levels = GarageFinish_levels, ordered = TRUE)
+Fence_levels <- c('Missing', 'MnWw', 'GdWo', 'MnPrv', 'GdPrv')
+train_csv$Fence <- factor(train_csv$Fence, levels = Fence_levels, ordered = TRUE)
+Slope_levels <- c('Sev', 'Mod', 'Gtl')
+train_csv$LandSlope <- factor(train_csv$LandSlope, levels = Slope_levels, ordered = TRUE)
+Paved_levels <- c('N', 'P', 'Y')
+train_csv$PavedDrive <- factor(train_csv$PavedDrive, levels = Paved_levels, ordered = TRUE)
+```
+
+Before we go ahead and predict our missing values, we'll first try and examine the variables in the dataset and see which variables are strongly associated or un-associated with our outcome variables. We'll use Cramers V test for categorical variables and ANOVA tests for numerical variables.
 
 
 ```{r}
-na_count_test
-```
-Missing data is present in the MSZoning, LotFrontage, Alley, Utilities, Exterior1st, Exterior2nd, MasVnrType, MasVnrArea, BsmtQual, BsmtCond, BsmtExposure, BsmtFinType1, BsmtFinSF1, BsmtFinType2, BsmtFinSF2, BsmtUnfSF, TotalBsmtSF, BsmtFullBath, BsmtHalfBath, KitchenQual, Functional, FireplaceQu, GarageType, GarageYrBlt, GarageFinish, GarageCars, GarageArea, GarageQual, GarageCond, PoolQC, Fence, MiscFeature, SaleType
-We will need to do further investigation into the data before we can decide if we will how to deal with these missing values
+feature_usefulness <- function(df, target_var) {
+  target <- df[[target_var]]
+  
+  # Drop NAs in target for association calculation
+  df <- df[!is.na(target), ]
+  target <- droplevels(df[[target_var]])
+  
+  results <- data.frame(
+    Variable = character(),
+    Type = character(),
+    Measure = character(),
+    Value = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (v in setdiff(names(df), target_var)) {
+    # Skip variables that are entirely missing or constant
+    if (all(is.na(df[[v]])) || length(unique(df[[v]])) < 2) next
+    
+    if (is.factor(df[[v]])) {
+      # Categorical predictor — use Cramér’s V
+      tbl <- table(df[[v]], target)
+      val <- tryCatch(DescTools::CramerV(tbl, bias.correct = TRUE), error = function(e) NA)
+      results <- rbind(results, data.frame(Variable = v, Type = "Categorical", Measure = "CramerV", Value = val))
+      
+    } else if (is.numeric(df[[v]])) {
+      # Numeric predictor — use correlation ratio (η²)
+      formula <- as.formula(paste(v, "~", target_var))
+      val <- tryCatch({
+        model <- aov(formula, data = df)
+        summary(model)[[1]][["Sum Sq"]][1] / sum(summary(model)[[1]][["Sum Sq"]])
+      }, error = function(e) NA)
+      results <- rbind(results, data.frame(Variable = v, Type = "Numeric", Measure = "EtaSquared", Value = val))
+    }
+  }
+  
+  results <- results %>%
+    arrange(desc(Value))
+  
+  return(results)
+}
 
-Let's examine this field by field, starting in the training data, although this field is also missing broadly in the testing data as well. First up, LotFrontage - defined as 'Linear feet of street connected to property'. We will first examine the shape of the variable
+usefulness_tbl <- feature_usefulness(train_csv, target_var = "BsmtExposure")
+significant_predictors <- usefulness_tbl %>%
+  filter((Measure == "CramerV" & Value > 0.1) |
+         (Measure == "EtaSquared" & Value > 0.05))
+```
+
+Now that we've got most of the missing categorical data appropriately assigned and imputed, we need to deal with the remaining missing values. Accomplishing this task will involve testing different methods to see which method provides the best results for imputation, as assessed by different methods (Accuracy of predictions, F1 Score). This function does several things that I'll describe briefly. First, there are a few safety checks that are completed as we select our significantly associated predictors (although this step is really more about removing very unassociated predictors), before a masked set of data is taken from the dataset and used to split the data into training / testing. We impute the values missing from the categories not being tested for (at this point LotFrontage, and the other categorical variables that are being imputed).Then with our cleaned data, we predict! As a baseline, we're using the mode values from the category as the outcome, which given the group sizes in these categories isn't a very bad idea. For two comparison methods, we'll use kNN and Random Forest classification models.
+
+```{r}
+evaluate_categorical_imputation <- function(df,
+                                            target_var,
+                                            predictor_vars = NULL,
+                                            mask_frac = 0.20,
+                                            k_knn = 5,
+                                            rf_ntree = 200,
+                                            seed = 123,
+                                            max_predictor_missing_frac = 0.5) {
+  set.seed(seed)
+  if (!target_var %in% names(df)) stop("target_var not found in dataframe")
+  # ensure target is factor
+  if (!is.factor(df[[target_var]])) df[[target_var]] <- as.factor(df[[target_var]])
+  
+  results_tbl <- feature_usefulness(train_csv, target_var = target_var)
+  significant_predictors <- results_tbl %>%
+  filter((Measure == "CramerV" & Value > 0.1) |
+         (Measure == "EtaSquared" & Value > 0.05))
+  
+  
+  # choose predictors if not provided: all columns except target
+  if (is.null(predictor_vars)) {
+    predictor_vars <- significant_predictors$Variable
+  }
+  
+  # Filter out predictors that are almost entirely missing
+  predictor_missing_frac <- sapply(df[predictor_vars], function(x) mean(is.na(x)))
+  keep_preds <- names(predictor_missing_frac)[predictor_missing_frac <= max_predictor_missing_frac]
+  if (length(keep_preds) == 0) stop("No predictors with acceptable missingness found")
+  predictor_vars <- keep_preds
+  
+  # Split known / missing target rows
+  known_idx <- which(!is.na(df[[target_var]]))
+  missing_target_idx <- which(is.na(df[[target_var]]))
+  if (length(known_idx) < 10) stop("Too few known target rows to evaluate reliably")
+  
+  # Mask a random subset of known targets for evaluation
+  mask_n <- max(1, round(length(known_idx) * mask_frac))
+  mask_idx <- sample(known_idx, mask_n)
+  df_masked <- df
+  true_values <- df[[target_var]][mask_idx]
+  df_masked[[target_var]][mask_idx] <- NA
+  
+  # Build training and testframes:
+  # training rows = rows with target known (after masking)
+  train_df <- df_masked %>% filter(!is.na(.data[[target_var]])) %>% select(all_of(c(target_var, predictor_vars)))
+  test_df  <- df_masked[mask_idx, , drop = FALSE] %>% select(all_of(c(target_var, predictor_vars)))
+  
+  # Apply simple imputation to predictors using only training distribution for numerics:
+  # For numeric medians we compute medians on training data and apply to both train/test,
+  # For categorical we map NAs to "Missing".
+  # Compute numeric medians from training.
+  numeric_preds <- predictor_vars[sapply(train_df[predictor_vars], is.numeric)]
+  medians <- sapply(train_df[numeric_preds], function(x) median(x, na.rm = TRUE))
+  for (col in numeric_preds){
+  train_df[[col]][is.na(train_df[[col]])] <- medians[[col]]
+  test_df[[col]][is.na(test_df[[col]])] <- medians[[col]]
+  }
+  
+  factor_preds <- setdiff(predictor_vars, numeric_preds)
+  for (col in factor_preds){
+    if(NA %in% train_df[[col]]){
+      levs <- c(levels(train_df[[col]]), 'MissingVal')
+      train_df[[col]] <- factor(train_df[[col]], levels = levs)
+      test_df[[col]] <- factor(test_df[[col]], levels = levs)
+    }
+    train_df[[col]][is.na(train_df[[col]])] <- 'MissingVal'
+  
+    if(NA %in% test_df[[col]]){
+      levs <- c(levels(test_df[[col]]), 'MissingVal')
+      train_df[[col]] <- factor(train_df[[col]], levels = levs)
+      test_df[[col]] <- factor(test_df[[col]], levels = levs)
+    }
+    test_df[[col]][is.na(test_df[[col]])] <- 'MissingVal'
+  }
+  
+  # If medians are NA (all missing), set to 0
+  medians[is.na(medians)] <- 0
+  
+  # Ensure target in train is factor and levels set
+  train_df[[target_var]] <- factor(train_df[[target_var]])
+  target_levels <- levels(train_df[[target_var]])
+  
+  # ---- 1) Baseline: Mode ----
+  mode_value <- names(sort(table(train_df[[target_var]]), decreasing = TRUE))[1]
+  pred_mode <- factor(rep(mode_value, nrow(test_df)), levels = target_levels)
+  acc_mode <- mean(pred_mode == true_values, na.rm = TRUE)
+  conf_mode <- table(Predicted = pred_mode, True = true_values)
+  
+  # ---- 2) kNN ----
+  # Build dummy variables using model.matrix on combined train+test so columns match
+  combined_preds <- bind_rows(
+    train_df %>% select(all_of(predictor_vars)),
+    test_df %>% select(all_of(predictor_vars))
+  )
+  # model.matrix: produce numeric matrix; uses training-level factors aligned via levels we set earlier
+  mm <- model.matrix(~ . - 1, data = combined_preds)  # no intercept, all predictors
+  # split back
+  ntr <- nrow(train_df)
+  train_mat <- mm[1:ntr, , drop = FALSE]
+  test_mat  <- mm[(ntr + 1):nrow(mm), , drop = FALSE]
+  
+  # scale numeric columns using training means/sds to make kNN distance meaningful
+  # identify numeric columns by checking which columns correspond to original numeric preds
+  # safe approach: scale all columns (mean/sd from train) — if sd=0, set sd=1
+  col_means <- colMeans(train_mat, na.rm = TRUE)
+  col_sds   <- apply(train_mat, 2, sd, na.rm = TRUE)
+  col_sds[col_sds == 0 | is.na(col_sds)] <- 1
+  train_mat_scaled <- sweep(sweep(train_mat, 2, col_means, "-"), 2, col_sds, "/")
+  test_mat_scaled  <- sweep(sweep(test_mat, 2, col_means, "-"), 2, col_sds, "/")
+  
+  
+  if (nrow(train_mat_scaled) < 1 || nrow(test_mat_scaled) < 1) {
+    warning("kNN: not enough data after filtering; returning NA for kNN")
+    pred_knn <- rep(NA, length(true_values))
+    acc_knn <- NA
+    conf_knn <- NULL
+  } else {
+    k_used <- min(k_knn, nrow(train_mat_scaled))
+    pred_knn_raw <- class::knn(train = train_mat_scaled, test = test_mat_scaled, cl = train_df[[target_var]], k = k_used)
+    # place predictions back into full masked size (some rows may have been dropped if non-finite)
+    pred_knn <- factor(pred_knn_raw, levels = target_levels)
+    acc_knn <- mean(pred_knn == true_values, na.rm = TRUE)
+    conf_knn <- table(Predicted = pred_knn, True = true_values)
+  }
+  
+  # ---- 3) Random forest ----
+  # Train randomForest on train_df, predict on test_df
+  rf_model <- tryCatch({
+    randomForest::randomForest(as.formula(paste(target_var, "~ .")), data = train_df, ntree = rf_ntree)
+  }, error = function(e) {
+    warning("randomForest failed: ", e$message)
+    NULL
+  })
+  if (is.null(rf_model)) {
+    pred_rf <- rep(NA, nrow(test_df))
+    acc_rf <- NA
+    conf_rf <- NULL
+  } else {
+    pred_rf_raw <- predict(rf_model, newdata = test_df)
+    pred_rf <- factor(pred_rf_raw, levels = target_levels)
+    acc_rf <- mean(pred_rf == true_values, na.rm = TRUE)
+    conf_rf <- table(Predicted = pred_rf, True = true_values)
+  }
+  
+  compute_precision_recall <- function(true, pred) {
+  # Ensure both are factors with same levels
+  true <- factor(true)
+  pred <- factor(pred, levels = levels(true))
+  
+  cm <- caret::confusionMatrix(pred, true)
+  precision <- mean(cm$byClass[, "Precision"], na.rm = TRUE)
+  recall <- mean(cm$byClass[, "Recall"], na.rm = TRUE)
+  
+  return(list(precision = precision, recall = recall))
+  }
+  
+  pr_mode <- compute_precision_recall(true_values, pred_mode)
+  f1_mode <- f1(true_values, pred_mode)
+  pr_knn  <- compute_precision_recall(true_values, pred_knn)
+  f1_knn <- f1(true_values, pred_knn)
+  pr_rf   <- compute_precision_recall(true_values, pred_rf)
+  f1_rf <- f1(true_values, pred_rf)
+  
+  # Compose summary results
+  summary_tbl <- tibble::tibble(
+    Method = c("Mode", paste0("kNN (k=", k_knn, ")"), "RandomForest"),
+    Accuracy = c(acc_mode, acc_knn, acc_rf),
+    Precision = c(pr_mode$precision, pr_knn$precision, pr_rf$precision),
+    Recall = c(pr_mode$recall, pr_knn$recall, pr_rf$recall),
+    F1_score = c(f1_mode, f1_knn, f1_rf),
+    N_test = nrow(test_df)
+  )
+  
+  # Return details
+  return(list(
+    summary = summary_tbl,
+    confusion = list(mode = conf_mode, knn = conf_knn, rf = conf_rf),
+    true_values = true_values,
+    preds = tibble(
+      row_in_original = mask_idx,
+      true = true_values,
+      pred_mode = pred_mode,
+      pred_knn = pred_knn,
+      pred_rf = pred_rf
+    ),
+    models = list(rf_model = rf_model),
+    train_info = list(n_train = nrow(train_df), predictors = predictor_vars)
+  ))
+}
+
+result_BsmtFinType2 <- evaluate_categorical_imputation(train_csv, target_var = "BsmtFinType2",
+                                           predictor_vars = NULL, mask_frac = 0.2,
+                                           k_knn = 15, rf_ntree = 225, seed = 123)
+result_Electrical <- evaluate_categorical_imputation(train_csv, target_var = "Electrical",
+                                           predictor_vars = NULL, mask_frac = 0.2,
+                                           k_knn = 15, rf_ntree = 225, seed = 123)
+result_BsmtExposure <- evaluate_categorical_imputation(train_csv, target_var = "BsmtExposure",
+                                           predictor_vars = NULL, mask_frac = 0.2,
+                                           k_knn = 15, rf_ntree = 225, seed = 123) 
+print(result_BsmtFinType2$summary)
+print(result_Electrical$summary)
+print(result_BsmtExposure$summary)
+```
+Results of the imputation methods show that RandomForest consistently produces the most accurate results, although the differences in accuracy between methods aren't particularly large, which should be expected given the group sizes in these variables. In assessing the actual utility of these methods in assigning correctly, we should instead rely on other methods, such as the F1 score, or the harmonic mean of the models precision and recall. The F1 score also shows that RandomForest consistently produces the best results in terms of correctly assigning True positives / True negative cases, for which the mode and kNN are not as well suited. Knowing this, we'll now use the Random Forest model to impute the missing values from our original training dataset. The below function separates data into known / NA for train / test, and uses the given model (in this case Random Forests, although it could be changed for other methods) to impute the missing values in our original dataset.
+
+```{r}
+impute_categorical_var <- function(df, target_var, method = "rf", k_knn = 5, rf_ntree = 200) {
+  
+  # Identify missing and known rows
+  missing_idx <- which(is.na(df[[target_var]]))
+  known_idx   <- which(!is.na(df[[target_var]]))
+  if (length(missing_idx) == 0) return(list(df = df, imputed = 0))
+  if (length(known_idx) < 10)  return(list(df = df, imputed = 0)) # too few for model training
+  
+  # Select predictors 
+  results_tbl <- feature_usefulness(train_csv, target_var = target_var)
+  significant_predictors <- results_tbl %>%
+  filter((Measure == "CramerV" & Value > 0.1) |
+         (Measure == "EtaSquared" & Value > 0.05))
+  predictors <- significant_predictors$Variable
+  
+  # Filter predictors to remove any with missing values
+  complete_predictors <- predictors[sapply(df[predictors], function(x) all(!is.na(x)))]
+  
+  df_train <- df[known_idx, complete_predictors, drop = FALSE]
+  df_test  <- df[missing_idx, complete_predictors, drop = FALSE]
+  y_train  <- df[known_idx, target_var, drop = TRUE]
+  
+  # Model fitting and prediction
+  preds <- NULL
+  if (method == "mode") {
+    mode_value <- names(sort(table(y_train), decreasing = TRUE))[1]
+    preds <- factor(rep(mode_value, length(missing_idx)), levels = levels(y_train))
+    
+  } else if (method == "knn") {
+    # Encode categoricals
+    combined <- rbind(df_train, df_test)
+    mm <- model.matrix(~ . - 1, data = combined)
+    train_mat <- mm[1:nrow(df_train), , drop = FALSE]
+    test_mat  <- mm[(nrow(df_train)+1):nrow(mm), , drop = FALSE]
+    
+    # Scale numeric columns
+    col_means <- colMeans(train_mat)
+    col_sds <- apply(train_mat, 2, sd)
+    col_sds[col_sds == 0] <- 1
+    train_mat <- sweep(sweep(train_mat, 2, col_means, "-"), 2, col_sds, "/")
+    test_mat  <- sweep(sweep(test_mat, 2, col_means, "-"), 2, col_sds, "/")
+    
+    preds <- knn(train = train_mat, test = test_mat, cl = y_train, k = k_knn)
+    
+  } else if (method == "rf") {
+    rf_model <- randomForest::randomForest(y = y_train, x = df_train, ntree = rf_ntree)
+    preds <- predict(rf_model, newdata = df_test)
+  } 
+  
+  # Replace missing values
+  df[[target_var]][missing_idx] <- preds
+  list(df = df, imputed = length(missing_idx))
+}
+
+impute_all_categorical <- function(df, method, k_knn = 5, rf_ntree = 200) {
+  cat_vars <- names(df)[sapply(df, function(x) is.factor(x))]
+  
+  results <- list()
+  total_imputed <- 0
+  
+  for (var in cat_vars) {
+    if (any(is.na(df[[var]]))) {
+      message("Imputing missing data in ", var, " using method = ", method, " ...")
+      res <- impute_categorical_var(df, target_var = var, method = method,
+                                    k_knn = k_knn, rf_ntree = rf_ntree)
+      df <- res$df
+      total_imputed <- total_imputed + res$imputed
+      results[[var]] <- res$imputed
+    }
+  }
+  
+  message("Imputation complete. Total categorical values imputed: ", total_imputed)
+  return(list(data = df, summary = results))
+}
+result <- impute_all_categorical(train_csv, method = "rf")
+train_csv <- result$data
+```
+
+And remember to assign these as ordinal variables.
+
+```{r}
+train_csv$BsmtFinType2 <- factor(train_csv$BsmtFinType2, levels = BsmtFinType_levels, ordered = TRUE)
+BsmtExposure_levels <- c('Missing', 'No', 'Mn', 'Av', 'Gd')
+train_csv$BsmtExposure <- factor(train_csv$BsmtExposure, levels = BsmtExposure_levels, ordered = TRUE)
+```
+
+Now we're all done with the categorical variables, which brings us to our last variable, the continuous LotFrontage - defined as 'Linear feet of street connected to property'. We will first examine the shape of the variable
+
 ```{r}
 train_density <- density(train_csv$LotFrontage, na.rm = TRUE)
 plot(x= train_density$x, y =train_density$y, main= 'density of lot frontage', xlab = 'value', ylab = 'density')
@@ -90,78 +467,70 @@ boxplot(train_csv$LotFrontage, main= 'boxplot of lot frontage')
 ```
 This data has a long right tail, there are outliers on both ends of the scale here, although there are a lot more large outliers rather than small outliers. This means that it might be difficult for imputing missing values by some measure of centrality in this dataset (i.e. mean or median) would likely lead to inaccuracies and problems further down the line.
 
-Let's check for correlations between the lot frontage and other variables. There are several that I would expect that have some correlation, including lot shape, lot area, building type, and variables related to the garage (although there's a small number of entries with missing value for the garage (~5%), so we may need to come back to this imputation later)
+Let's check for correlations between the lot frontage and other variables. There are several that I would expect that have some correlation, including lot shape, lot area, building type, and variables related to the size of the property, but specifically those related to the garage.
+
 ```{r}
-num_cols <- sapply(train_csv, is.numeric)
-cor_results <- cor(train_csv$LotFrontage, train_csv[num_cols], method = 'pearson', use = 'complete.obs')
-cor_results <- as.data.frame(as.table(cor_results))
-cor_results$Freq <- abs(cor_results$Freq)
-cor_results <- cor_results[order(-abs(cor_results$Freq)), ]
-top_11 <- head(cor_results, 11)
-top_11[2:11,2:3]
+num_cols <- names(train_csv)[sapply(train_csv, is.numeric)]
+num_cols <- num_cols[-2] #removing LotFrontage
+results_table_numeric <- tibble(
+    Variable = character(0),
+    correlation = 0,
+    P_value = 0)
+for (var in num_cols){
+  corr <- cor.test(train_csv$LotFrontage, train_csv[[var]])
+  results_table_numeric <- results_table_numeric %>%
+        add_row(Variable = var, correlation = corr$estimate, P_value = corr$p.value)
+}
+results_table_numeric %>% arrange(P_value)
 ```
-The top 10 variables that relate to lot frontage are the area of the first floor, the lot area, the living area, basement area, zoning subclass, garage area, total rooms above ground, sale price (not useful for us here), the number of cars that can fit in the garage, and the number of bedrooms above ground. This can broadly be interpreted as a larger house (i.e. one with more area in the total lot, more living area, more garage area, rooms above ground) can be correlated with an increase in lot frontage
+The top 10 variables that relate to lot frontage are the area of the first floor, the lot area, the living area, basement area, zoning subclass, garage area, total rooms above ground, sale price (not useful for us here as we'll also have to impute this in our test data where we won't have access to this variable), the number of cars that can fit in the garage, and the number of bedrooms above ground. This can broadly be interpreted as a larger house (i.e. one with more area in the total lot, more living area, more garage area, rooms above ground) can be correlated with an increase in lot frontage. Overall, there are 25 variables that reach a traditionally statistically significance level of association with a p-value < 0 .05.
 
-We'll now try and evaluate the links between the other non-numerical variables and lot frontage. We'll first convert the character variables to factors, which they broadly are, and then conduct ANOVA or t-tests to evaluate whether the means of the groups differ by a significant amount.
-```{r}
-factor_vars <- lapply(train_csv, is.factor)
-anova_results <- aov(LotFrontage ~ MSZoning, data = train_csv)
-summary(anova_results)
-TukeyHSD(anova_results)
-```
+We'll now try and evaluate the links between the other non-numerical variables and lot frontage. We'll conduct ANOVA or t-tests depending on the group sizes (most groups have more than 2 levels so will be using ANOVA) to evaluate whether the means of the groups differ by a significant amount.
 
 ```{r}
-#Change character columns to factors
-character_cols <- lapply(train_csv, class) == 'character'
-train_csv[,character_cols] <- lapply(train_csv[,character_cols], as.factor)
-# Identify all factor columns (excluding LotFrontage)
-factor_vars <- names(train_csv)[sapply(train_csv, is.factor)]
-
-# Create an empty list to store results
-anova_results <- list()
-
-# Loop through each factor variable and run ANOVA
+factor_vars <-names(train_csv)[sapply(train_csv, is.factor)]
+results_table_anova <- tibble(
+  Variable = character(0),
+  F_value = 0,
+  P_value = 0,
+  Num_Groups = 0,
+  eta_squared = 0
+)
 for (var in factor_vars) {
   n_levels <- nlevels(train_csv[[var]])
-  
-  if (n_levels > 2) {
-    # Build the formula dynamically, e.g. LotFrontage ~ Neighborhood
+  data <- train_csv[[var]]
+  if (length(unique(data)) > 2){
     formula <- as.formula(paste("LotFrontage ~", var))
-    
-    # Run one-way ANOVA
-    model <- aov(formula, data = train_csv)
-    
-    #Extract ANOVA summary
-    summary_model <- summary(model)[[1]]
-    
-    # Extract p-value from the ANOVA summary table
-    p_value <- summary_model[["Pr(>F)"]][1]
-    
-     # Compute η² (effect size) = SS_between / SS_total
-    ss_between <- summary_model[["Sum Sq"]][1]
-    ss_total <- sum(summary_model[["Sum Sq"]])
-    eta_squared <- ss_between / ss_total
-    
-    # Store results in a list
-    anova_results[[var]] <- data.frame(
-      Variable = var,
-      Levels = n_levels,
-      p_value = p_value,
-      eta_squared = eta_squared
-    )
+    anova_results <- aov(formula, data = train_csv)
+    eta_squared <- eta_squared(anova_results)
+  #print(anova_results)
+    results_table_anova <- results_table_anova %>%
+      add_row(Variable = var, F_value = summary(anova_results)[1][[1]]$`F value`[1], P_value = summary(anova_results)[[1]]$`Pr(>F)`[1], Num_Groups = n_levels, eta_squared = eta_squared)
+  }
+  else{
+    group_sizes <- table(train_csv[[var]])
+    if (any(group_sizes==1)){
+      cat(var, "skipped, not enough observations")
+      next}
+    else{
+      formula <- as.formula(paste("LotFrontage ~", var))
+      test <- t.test(formula, data = train_csv)
+      eta_squared <- (test$statistic)^2 / ((test$statistic)^2 + (length(train_csv[[var]]) - 2))
+      results_table_anova <- results_table_anova %>%
+        add_row(Variable = var, F_value = test$statistic, P_value = test$p.value, Num_Groups = n_levels, eta_squared = eta_squared)
+    }
   }
 }
 
-# Combine all results into one data frame
-anova_summary <- do.call(rbind, anova_results)
+results_table_anova %>% arrange(P_value)
 
-# Sort results by significance (smallest p-values first)
-anova_summary <- anova_summary[order(anova_summary$p_value), ]
-
-# Show results
-anova_summary
 ```
-There are several more significantly correlated factors than there are continuous variables that correlate with LotFrontage, however there are some caveats that should be observed. ANOVA's have several assumptions that are key to the results being interpretable, no significant outliers, equality of variances, and normal distribution, and these should be tested before we accept these results.
+We get results of association for all variables except utilities, which has two levels with one level only having one observation. The results of the various ANOVA and t-tests show that the categorical variables broadly show some significant association with LotFrontage, 34 categorical variables reach a traditionally accepted p < 0.05 significantly associated threshold. Despite this, most variables show an eta_squared value (percentage of total variance accounted for by differences between the groups) that would generally be described as small, the top 11 show an eta > 0.06, which is traditionally accepted as a moderate effect. In any case, a good model will be able to take into account these smaller effects when imputing these values.
+
+ANOVA's have several assumptions that are key to the results being interpretable, no significant outliers, equality of variances, and normal distribution, and these should be tested before we accept these results. If groups are normally distributed with equal variances, then a normal ANOVA would be reasonable, however if variances are unequal, we need to apply Welch's correction for an ANOVA, and if neither assumption is met then we need to use the Games-Howell test to assess for association. 
+
+The below function gathers the dependent and outcome variable, removing empty observations, skipping groups with 2 or fewer groups, combines groups with small sizes (i.e. < 5 observations) into a new group ("Other"), rechecks to see if there are a sufficient number of groups (> 2) and skips variables with insufficient groups. The function then checks normality and equality of variances, and then carries out the appropriate test of association for the group.
+
 ```{r}
 library(dplyr)
 library(car)
@@ -169,24 +538,44 @@ library(stats)
 
 check_anova_assumptions_adjusted <- function(df, outcome_var, cat_vars,
                                              alpha = 0.05,
-                                             min_per_group = 2,
-                                             adjust_method = "BH",
+                                             min_per_group = 3,
+                                             min_obs_per_level = 5,
                                              make_plots = FALSE) {
   results <- list()
   
   for (var in cat_vars) {
     cat("\n--- Checking:", var, "---\n")
-    tmp <- df %>% select(all_of(c(outcome_var, var))) %>% na.omit()
+    tmp <- df %>% 
+      select(all_of(c(outcome_var, var))) %>%
+      na.omit()
     
-    # Ensure categorical
-    if (!is.factor(tmp[[var]])) tmp[[var]] <- as.factor(tmp[[var]])
-    if (nlevels(tmp[[var]]) < 2) {
-      cat("Skipped:", var, "has <2 levels.\n")
+    #Only check groups we need to, i.e. those with more than 2 groups
+    if (nlevels(tmp[[var]]) < 3) {
+      cat("Skipped:", var, "has < 3 levels.\n")
       next
     }
     if (any(table(tmp[[var]]) < min_per_group)) {
       cat("Warning:", var, "has groups with fewer than", min_per_group, "samples.\n")
     }
+    
+    
+    valid_levels <- names(which(table(df[[var]]) >= min_obs_per_level))
+    tmp[[var]] <- forcats::fct_other(tmp[[var]],
+                                 keep = valid_levels,
+                                 other_level = "Other")
+    tmp[[var]] <- droplevels(tmp[[var]])
+    
+    level_counts2 <- table(tmp[[var]])
+    valid_levels2 <- names(level_counts2[level_counts2 >= min_obs_per_level])
+    tmp <- tmp[tmp[[var]] %in% valid_levels2, , drop = FALSE]
+    tmp[[var]] <- droplevels(tmp[[var]])
+    
+    if (nlevels(tmp[[var]]) < 3) {
+      cat("Skipped:", var, "has < 3 levels after filtering for small groups.\n")
+      next
+    }
+    
+    
     
     formula_str <- paste(outcome_var, "~", var)
     aov_model <- tryCatch(aov(as.formula(formula_str), data = tmp),
@@ -249,7 +638,7 @@ check_anova_assumptions_adjusted <- function(df, outcome_var, cat_vars,
       Recommended_Test = recommended,
       stringsAsFactors = FALSE
     )
-  }
+    }
   
   results_df <- do.call(rbind, results)
   rownames(results_df) <- NULL
@@ -258,133 +647,30 @@ check_anova_assumptions_adjusted <- function(df, outcome_var, cat_vars,
     group_by(Variable) %>%
     summarise(
       n_pairs = n(),
-      fisher_chi2 = -2*sum(log(Test_p)),
+      P_value= fisher(Test_p)$p,
       df = 2*n_pairs,
-      combined_p = 1-pchisq(fisher_chi2, df = df)
-    ) %>%
-    ungroup() %>%
-    mutate(Adjusted_p = p.adjust(combined_p, method = adjust_method)) %>%
-    arrange(Adjusted_p)
+    )
   
-  # Print summary of significant predictors
-  sig_vars <- fisher_df %>% filter(!is.na(Adjusted_p) & Adjusted_p < alpha)
-  cat("\nSignificant predictors after adjustment (alpha =", alpha, "):\n")
-  print(sig_vars %>% select(Variable, Adjusted_p))
-  
-  return(fisher_df)
+  return(fisher_df %>% arrange(P_value))
 }
 
-# ---------------- Example Usage ----------------
 cat_vars <- names(train_csv)[sapply(train_csv, is.factor)]
-anova_summary <- check_anova_assumptions_adjusted(
+results_table_gh <- check_anova_assumptions_adjusted(
   df = train_csv,
   outcome_var = "LotFrontage",
   cat_vars = cat_vars,
   alpha = 0.05,
-  adjust_method = "BH",  # or "bonferroni"
   make_plots = FALSE
 )
 
-head(anova_summary)
+print(results_table_gh)
 ```
 
-Should do something to include the two factor variables, and should test the assumptions underlying the ANOVA results, and should figure out if this means that these would be good to use with to predict the lotfrontage, and then should actually do that.
+All variables that did test used the Games-Howell test, indicating that neither the variables are normally distributed nor were the variances between groups equal. Two variables started with two levels (Street and CentralAir) so were not going to be included in the ANOVA regardless, and two more simplified down to a two sample test (MiscFeature and PoolQC) once very rare groups were removed. This test provides a more stringent and more statistically rigorous method of testing for association between the dependent variable (in this case LotFrontage) and the categorical variables which shows 18 variables meet a traditional p < 0.05 threshold compared to the 34 found when using a standard ANOVA on all categorical variables, although for the least strict threshold I'll use (0.1) there are a total of 23 variables found to have some association. 
 
-```{r}
-dependent_var <- "LotFrontage"
+Whilst this does produce a list of variables that we are more confident about claiming an association between the dependent and outcome variable, does this list of variables actually perform better than the list produced by ANOVA analysis when imputing the unknown values? We'll perform some testing now to check if this is the case. The next two functions will be the same, with one using ANOVA testing solely to check which categorical variables are more closely related to the outcome and one using Games-Howell testing to check for association. Beyond this, both functions aim to do the same thing, generate a list of variables that are associated with the outcome (LotFrontage in this case), then test different prediction methods, linear regression, random forest, and chained equations (MICE), with a combination of different parameter values for these methods as part of cross validation.
 
-results_list <- list()
-
-for (var in names(train_csv)) {
-  if (is.factor(train_csv[[var]])) {
-    
-    # Prepare data and drop NA
-    temp <- train_csv %>%
-      select(all_of(dependent_var), all_of(var)) %>%
-      drop_na()
-    
-    if (nrow(temp) < 10) next
-    
-    temp[[var]] <- droplevels(temp[[var]])
-    n_levels <- nlevels(temp[[var]])
-    if (n_levels < 2) next
-    
-    # Check group sizes
-    group_sizes <- table(temp[[var]])
-    if (min(group_sizes) < 2) next  # need at least 2 observations per group
-    size_ratio <- max(group_sizes) / min(group_sizes)
-    similar_sizes <- size_ratio < 1.5
-    
-    # Check variance equality
-    levene_res <- levene_test(temp, as.formula(paste(dependent_var, "~", var)))
-    equal_var <- levene_res$p > 0.05
-    
-    # Run ANOVA
-    aov_model <- aov(as.formula(paste(dependent_var, "~", var)), data = temp)
-    anova_summary <- summary(aov_model)[[1]]
-    anova_p <- anova_summary[["Pr(>F)"]][1]
-    
-    # Compute effect size (eta squared)
-    effsize <- eta_squared(aov_model)
-    effsize_value <- effsize
-    
-    # Initialize results row
-    base_result <- data.frame(
-      variable = var,
-      n_levels = n_levels,
-      levene_p = levene_res$p,
-      equal_var = equal_var,
-      size_ratio = round(size_ratio, 2),
-      anova_p = anova_p,
-      eta2 = effsize_value,
-      test_used = NA,
-      comparison = NA,
-      estimate = NA,
-      p_adj = NA
-    )
-    
-    # Run post-hoc if significant
-    if (anova_p < 0.05) {
-      if (equal_var && similar_sizes) {
-        posthoc <- TukeyHSD(aov_model)
-        post_df <- as.data.frame(posthoc[[1]])
-        post_df <- tibble::rownames_to_column(post_df, "comparison")
-        post_df <- post_df %>%
-          mutate(
-            variable = var,
-            test_used = "TukeyHSD",
-            anova_p = anova_p,
-            eta2 = effsize_value,
-            p_adj = `p adj`
-          ) %>%
-          select(variable, test_used, comparison, diff, lwr, upr, p_adj, eta2)
-        results_list[[var]] <- post_df
-      } else {
-        post_df <- games_howell_test(temp, as.formula(paste(dependent_var, "~", var))) %>%
-          mutate(
-            variable = var,
-            test_used = "Games-Howell",
-            eta2 = effsize_value
-          ) %>%
-          select(variable, test_used, group1, group2, estimate, conf.low, conf.high, p.adj, eta2)
-        results_list[[var]] <- post_df
-      }
-    } else {
-      # If not significant, store base ANOVA results
-      results_list[[var]] <- base_result
-    }
-  }
-}
-
-# Combine results
-posthoc_results <- bind_rows(results_list)
-
-# View top entries
-posthoc_results %>%
-  arrange(anova_p)
-```
-
-
+Given it's a long function, and it can take a few minutes to run (or longer if the parameter grid is expanded), I'll explain briefly what it specifically does, as this will form the basis of the imputation of the other continuous variables, the sale price. Firstly, the parameter grid is set by the user, by making the alpha values more stringent (i.e. 1e-12) we can restrict the association to the top ~30 most associated variables, compared to 59 at the least stringent standards of p < 0.05. The function aims to evaluate each possible combination of parameters possible so be careful when expanding the grid as each addition does make runtime increase significantly. These combinations are ran in parallel using the plan and future packages for this reason. Variables are selected by association as previously described, data is masked using a few safety methods to ensure completeness and validity of testing, and then prediction is carried out using the previously noted methods.
 
 ```{r}
 set.seed(123)
@@ -393,9 +679,9 @@ set.seed(123)
 df_all <- train_csv
 
 # PARAM GRID (customise as needed)
-alpha_cor_values    <- c(1e-6, 1e-5, 1e-4, 1e-3, 5e-3, 1e-2, 5e-2)
-alpha_anova_values  <- c(1e-8, 1e-6, 1e-4, 1e-3, 5e-3, 1e-2, 5e-2)
-missforest_ntree    <- c(50, 100, 125, 140, 150, 160, 170, 180, 190, 200, 250)
+alpha_cor_values    <- c(1e-8, 1e-6, 1e-4, 1e-2, 5e-2)
+alpha_anova_values  <- c(1e-8, 1e-6, 1e-4, 1e-2, 5e-2)
+missforest_ntree    <- c(50, 100, 150, 200)
 mice_methods        <- c("cart")        # keep small list to limit runtime
 
 # parallel plan: use most cores but leave one free
@@ -411,16 +697,16 @@ param_grid <- expand.grid(
   stringsAsFactors = FALSE
 )
 
-# The core evaluator: this is essentially your working script, parameterised.
+# The core evaluator
 evaluate_combo <- function(row_params, df = df_all,
                            target_var = "LotFrontage",
                            mask_frac = 0.20,
+                           min_obs_per_level = 5,
                            min_obs_cor = 10,
                            min_obs_anova = 20,
                            min_rows_train = 30,
                            max_mask_attempts = 200) {
-  # Load libs inside worker (ensures packages are available in worker env)
-  library(dplyr); library(glmnet); library(mice); library(missForest); library(tibble)
+
   # capture parameters
   alpha_cor   <- row_params$alpha_cor
   alpha_anova <- row_params$alpha_anova
@@ -431,49 +717,19 @@ evaluate_combo <- function(row_params, df = df_all,
   tryCatch({
     df <- df  # use df_all by default
     
-    # -- Step 1: candidate predictors --
-    numeric_vars <- names(df)[sapply(df, is.numeric) & names(df) != target_var]
-    factor_vars  <- names(df)[sapply(df, is.factor)]
-    
-    # -- Step 2: select numeric predictors by correlation (safe)
-    selected_numeric <- c()
-    for (v in numeric_vars) {
-      idx <- which(!is.na(df[[target_var]]) & !is.na(df[[v]]))
-      if (length(idx) < min_obs_cor) next
-      ct <- tryCatch(cor.test(df[[target_var]][idx], df[[v]][idx], method = "pearson"),
-                     error = function(e) NULL)
-      if (!is.null(ct) && !is.na(ct$p.value) && (ct$p.value < alpha_cor)) {
-        selected_numeric <- c(selected_numeric, v)
-      }
-    }
-    
-    # -- Step 3: select factor predictors by ANOVA (safe)
-    selected_factors <- c()
-    for (v in factor_vars) {
-      tmp <- df %>% select(all_of(c(target_var, v))) %>% tidyr::drop_na()
-      if (nrow(tmp) < min_obs_anova) next
-      tmp[[v]] <- droplevels(tmp[[v]])
-      if (nlevels(tmp[[v]]) < 2) next
-      if (any(table(tmp[[v]]) < 2)) next
-      aov_res <- tryCatch(aov(as.formula(paste(target_var, "~", v)), data = tmp),
-                          error = function(e) NULL)
-      if (is.null(aov_res)) next
-      p <- tryCatch(summary(aov_res)[[1]][["Pr(>F)"]][1], error = function(e) NA)
-      if (!is.na(p) && p < alpha_anova) selected_factors <- c(selected_factors, v)
-    }
+    # select numeric predictors by correlation 
+    selected_numeric <- results_table_numeric$Variable[results_table_numeric$P_value < alpha_cor]
+   
+    # select factor predictors by ANOVA 
+    selected_factors <- results_table_anova$Variable[results_table_anova$P_value < alpha_anova]
     
     selected_predictors <- c(selected_numeric, selected_factors)
     if (length(selected_predictors) == 0) {
-      # Return NA metrics but include the param settings
-      return(tibble(
-        alpha_cor = alpha_cor, alpha_anova = alpha_anova,
-        en_alpha = en_alpha, mf_ntree = mf_ntree, mice_method = mice_method,
-        Method = c("Linear Regression", "Elastic Net", "MICE", "missForest"),
-        RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_, n_predictors = 0
-      ))
+      # Return parameter settings
+      return(sprintf('No predictors found at p_values of %d for correlation and %s for ANOVA. Please adjust these values and try again', alpha_cor, alpha_anova))
     }
     
-    # -- Step 4: keep only rows where predictors are complete (fair comparison) --
+    # keep only rows where predictors are complete (fair comparison) --
     predictor_complete_idx <- complete.cases(df[, selected_predictors, drop = FALSE])
     model_df <- df[predictor_complete_idx, c(target_var, selected_predictors), drop = FALSE]
     
@@ -489,7 +745,265 @@ evaluate_combo <- function(row_params, df = df_all,
       ))
     }
     
-    # -- Step 5: mask creation (ensure training retains factor levels) --
+    # mask creation (ensure training retains factor levels) --
+    mask_n <- max(1, round(length(known_idx) * mask_frac))
+    attempt <- 1
+    mask_indices_final <- NULL
+    
+    # helper for mask validity
+    # checks there are enough levels in the factors present 
+    valid_mask <- function(mask_idx, df_model, factor_predictors) {
+      train_idx <- setdiff(which(!is.na(df_model[[target_var]])), mask_idx)
+      if (length(train_idx) < min_rows_train) return(FALSE)
+      for (f in factor_predictors) {
+        if (!is.factor(df_model[[f]])) next
+        nlev <- nlevels(droplevels(df_model[[f]][train_idx]))
+        if (nlev < 2) return(FALSE)
+      }
+      TRUE
+    }
+    
+    factor_preds_in_selected <- selected_factors[selected_factors %in% selected_predictors]
+    
+    while (attempt <= max_mask_attempts) {
+      mask_idx_try <- sample(known_idx, mask_n)
+      if (valid_mask(mask_idx_try, model_df, factor_preds_in_selected)) {
+        mask_indices_final <- mask_idx_try
+        break
+      }
+      attempt <- attempt + 1
+    }
+    if (is.null(mask_indices_final)) {
+      # fallback try smaller mask fractions
+      found <- FALSE
+      for (mf in seq(mask_frac/2, 0.02, by = -0.01)) {
+        mask_n2 <- max(1, round(length(known_idx) * mf))
+        attempt2 <- 1
+        while(attempt2 <= max_mask_attempts) {
+          mask_idx_try <- sample(known_idx, mask_n2)
+          if (valid_mask(mask_idx_try, model_df, factor_preds_in_selected)) {
+            mask_indices_final <- mask_idx_try
+            found <- TRUE
+            break
+          }
+          attempt2 <- attempt2 + 1
+        }
+        if (found) break
+      }
+    }
+    
+    # Prepare masked dataframe 
+    df_model_masked <- model_df
+    true_values <- df_model_masked[[target_var]][mask_indices_final]
+    df_model_masked[[target_var]][mask_indices_final] <- NA  # mask
+    
+    train_idx <- which(!is.na(df_model_masked[[target_var]]))
+    test_idx  <- mask_indices_final
+    
+    # Drop single-level factors or constant numerics in training
+    final_predictors <- selected_predictors
+    if (length(selected_factors) > 0) {
+      for (f in selected_factors) {
+        if (f %in% final_predictors) {
+          nlev_train <- nlevels(droplevels(df_model_masked[[f]][train_idx]))
+          if (nlev_train < 2) {
+            final_predictors <- setdiff(final_predictors, f)
+          }
+        }
+      }
+    }
+    for (nvar in selected_numeric) {
+      if (nvar %in% final_predictors) {
+        if (var(df_model_masked[[nvar]][train_idx], na.rm = TRUE) == 0) {
+          final_predictors <- setdiff(final_predictors, nvar)
+        }
+      }
+    }
+    
+    # Build train/test frames
+    train_df_reg <- df_model_masked[train_idx, c(target_var, final_predictors), drop = FALSE]
+    test_df_reg  <- df_model_masked[test_idx,  c(target_var, final_predictors), drop = FALSE]
+    
+    # Align factor levels: set test levels to training levels (prevents "new levels" error)
+    for (f in final_predictors) {
+      if (is.factor(train_df_reg[[f]])) {
+        levs <- levels(droplevels(train_df_reg[[f]]))
+        train_df_reg[[f]] <- factor(train_df_reg[[f]], levels = levs)
+        test_df_reg[[f]]  <- factor(test_df_reg[[f]], levels = levs)  # unseen => NA (safe)
+      }
+    }
+    
+    # -------- Linear regression --------
+    lm_pred <- rep(NA_real_, length(test_idx))
+    lm_success <- FALSE
+    if (nrow(train_df_reg) >= 5 && length(final_predictors) > 0) {
+      lm_formula <- as.formula(paste(target_var, "~", paste(final_predictors, collapse = " + ")))
+      lm_fit <- tryCatch(lm(lm_formula, data = train_df_reg), error = function(e) e)
+      if (!inherits(lm_fit, "error")) {
+        # predict; rows with NA predictors will produce NA predictions
+        lm_pred <- tryCatch(predict(lm_fit, newdata = test_df_reg), error = function(e) rep(NA_real_, nrow(test_df_reg)))
+        lm_success <- TRUE
+      }
+    }
+    
+    # -------- MICE (masking already done in test_df_reg: LotFrontage is NA in test rows) --------
+    mice_pred <- rep(NA_real_, length(test_idx))
+    mice_success <- FALSE
+    # Combine train+test (with test's LotFrontage currently NA) and impute
+    combined_for_mice <- rbind(train_df_reg, test_df_reg)
+    mice_result <- tryCatch(mice(combined_for_mice, m = 1, maxit = 5, method = mice_method, printFlag = FALSE),
+                            error = function(e) NULL)
+    if (!is.null(mice_result)) {
+      mice_imputed <- complete(mice_result)
+      ntr <- nrow(train_df_reg)
+      mice_test  <- mice_imputed[(ntr + 1):nrow(mice_imputed), , drop = FALSE]
+      mice_pred <- mice_test[[target_var]]
+      mice_success <- TRUE
+    }
+    
+    # -------- missForest (masking already done in test_df_reg) --------
+    mf_pred <- rep(NA_real_, length(test_idx))
+    mf_success <- FALSE
+    combined_for_mf <- rbind(train_df_reg, test_df_reg)
+    # ensure types are appropriate; missForest expects factors as factors and numerics numeric
+    mf_out <- tryCatch(missForest(combined_for_mf, maxiter = 10, ntree = mf_ntree, verbose = TRUE),
+                       error = function(e) NULL)
+    if (!is.null(mf_out)) {
+      mf_imputed <- mf_out$ximp
+      ntr <- nrow(train_df_reg)
+      mf_pred <- mf_imputed[[target_var]][(ntr + 1):nrow(mf_imputed)]
+      mf_success <- TRUE
+    }
+    
+    
+    # Evaluate metrics using the true_values vector and each predicted vector
+    eval_metrics <- function(true, pred) {
+      ok <- !is.na(true) & !is.na(pred)
+      if (sum(ok) == 0) return(list(n = 0, RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_))
+      t <- true[ok]; p <- pred[ok]
+      list(n = sum(ok), RMSE = sqrt(mean((t - p)^2)), MAE = mean(abs(t - p)), R2 = if (length(t) > 1) cor(t, p)^2 else NA_real_)
+    }
+    
+    res_lm   <- eval_metrics(true_values, lm_pred)
+    res_mice <- eval_metrics(true_values, mice_pred)
+    res_mf   <- eval_metrics(true_values, mf_pred)
+    
+    # Compose results tibble for this combination
+    result_tib <- tibble::tibble(
+      alpha_cor = alpha_cor,
+      alpha_anova = alpha_anova,
+      mf_ntree = mf_ntree,
+      mice_method = mice_method,
+      Method = c("Linear Regression", "MICE", "missForest"),
+      RMSE = c(res_lm$RMSE, res_mice$RMSE, res_mf$RMSE),
+      MAE  = c(res_lm$MAE, res_mice$MAE, res_mf$MAE),
+      R2   = c(res_lm$R2, res_mice$R2, res_mf$R2),
+      n_predictors = length(final_predictors)
+    )
+    
+    return(result_tib)
+    
+  }, error = function(e) {
+    # On error, return NA result with the parameters
+    tibble::tibble(
+      alpha_cor = alpha_cor,
+      alpha_anova = alpha_anova,
+      mf_ntree = mf_ntree,
+      mice_method = mice_method,
+      Method = c("Linear Regression", "Elastic Net", "MICE", "missForest"),
+      RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_,
+      n_predictors = NA_integer_
+    )
+  })
+}
+
+# Run grid in parallel (use reproducible random seeds)
+# convert each row of param_grid to a list for mapping
+param_list <- split(param_grid, seq_len(nrow(param_grid)))
+
+# Use future_map_dfr with reproducible seeds
+results_all_anova <- future_map_dfr(param_list, evaluate_combo, .options = furrr_options(seed = TRUE))
+
+# Clean up: restore sequential plan if desired
+plan(sequential)
+
+# You can also inspect best combos:
+best_by_method <- results_all_anova %>%
+  group_by(Method) %>%
+  filter(!is.na(RMSE)) %>%
+  slice_min(RMSE, n = 1, with_ties = FALSE) %>%
+  ungroup()
+print(best_by_method)
+```
+```{r}
+set.seed(123)
+
+# Use your dataframe name
+df_all <- train_csv
+
+# PARAM GRID (customise as needed)
+alpha_cor_values    <- c(1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-2, 5e-2)
+alpha_gh_values     <- c(1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-2, 5e-2, 1e-1)
+missforest_ntree    <- c(50, 100, 150, 200, 250, 300, 350, 400)
+mice_methods        <- c("cart")        # keep small list to limit runtime
+
+# parallel plan: use most cores but leave one free
+workers_to_use <- max(1, future::availableCores() - 1)
+plan(multisession, workers = workers_to_use)
+
+# make grid as a data.frame of combos
+param_grid <- expand.grid(
+  alpha_cor = alpha_cor_values,
+  alpha_gh = alpha_gh_values,
+  mf_ntree = missforest_ntree,
+  mice_method = mice_methods,
+  stringsAsFactors = FALSE
+)
+
+# The core evaluator
+evaluate_combo <- function(row_params, df = df_all,
+                           target_var = "LotFrontage",
+                           mask_frac = 0.20,
+                           min_obs_per_level = 5,
+                           min_obs_cor = 10,
+                           min_obs_anova = 20,
+                           min_rows_train = 30,
+                           max_mask_attempts = 20) {
+  # capture parameters
+  alpha_cor   <- row_params$alpha_cor
+  alpha_gh    <- row_params$alpha_gh
+  mf_ntree    <- row_params$mf_ntree
+  mice_method <- row_params$mice_method
+  
+  # wrap in tryCatch so a single failing combo returns NA row
+  tryCatch({
+    df <- df  # use df_all by default
+    
+    # select numeric predictors by correlation 
+    selected_numeric <- results_table_numeric$Variable[results_table_numeric$P_value < alpha_cor]
+   
+    # select factor predictors by Games-Howell 
+    selected_factors <- results_table_gh$Variable[results_table_gh$P_value < alpha_gh]
+    
+    selected_predictors <- c(selected_numeric, selected_factors)
+    if (length(selected_predictors) == 0) {
+      # Return parameter settings
+      return(sprintf('No predictors found at p_values of %d for correlation and %s for ANOVA. Please adjust these values and try again', alpha_cor, alpha_gh))
+    }
+    
+    
+      # keep only rows where predictors are complete 
+    predictor_complete_idx <- complete.cases(df[, selected_predictors, drop = FALSE])
+    model_df <- df[predictor_complete_idx, c(target_var, selected_predictors), drop = FALSE]
+    
+    # known indices (where target known)
+    known_idx <- which(!is.na(model_df[[target_var]]))
+    if (length(known_idx) < (min_rows_train + 2)) {
+      # not enough data to evaluate this combo properly -> return NA results
+      return(sprintf('No predictors found at p_values of %d for correlation and %s for ANOVA. Please adjust these values and try again', alpha_cor, alpha_gh))
+    }
+    
+    # mask creation (ensure training retains factor levels) --
     mask_n <- max(1, round(length(known_idx) * mask_frac))
     attempt <- 1
     mask_indices_final <- NULL
@@ -534,12 +1048,7 @@ evaluate_combo <- function(row_params, df = df_all,
         if (found) break
       }
       if (!found) {
-        return(tibble(
-          alpha_cor = alpha_cor, alpha_anova = alpha_anova,
-          en_alpha = en_alpha, mf_ntree = mf_ntree, mice_method = mice_method,
-          Method = c("Linear Regression", "Elastic Net", "MICE", "missForest"),
-          RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_, n_predictors = length(selected_predictors)
-        ))
+        return(sprintf('No masking found at masking fraction %d and max mask attempts %f, please adjust these values and try again', mask_frac, max_mask_attempts))
       }
     }
     
@@ -572,7 +1081,7 @@ evaluate_combo <- function(row_params, df = df_all,
     }
     if (length(final_predictors) == 0) {
       return(tibble(
-        alpha_cor = alpha_cor, alpha_anova = alpha_anova,
+        alpha_cor = alpha_cor, alpha_gh = alpha_gh,
         en_alpha = en_alpha, mf_ntree = mf_ntree, mice_method = mice_method,
         Method = c("Linear Regression", "Elastic Net", "MICE", "missForest"),
         RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_, n_predictors = 0
@@ -649,7 +1158,7 @@ evaluate_combo <- function(row_params, df = df_all,
     # Compose results tibble for this combination
     result_tib <- tibble::tibble(
       alpha_cor = alpha_cor,
-      alpha_anova = alpha_anova,
+      alpha_gh = alpha_gh,
       mf_ntree = mf_ntree,
       mice_method = mice_method,
       Method = c("Linear Regression", "MICE", "missForest"),
@@ -665,7 +1174,7 @@ evaluate_combo <- function(row_params, df = df_all,
     # On error, return NA result with the parameters
     tibble::tibble(
       alpha_cor = alpha_cor,
-      alpha_anova = alpha_anova,
+      alpha_gh = alpha_gh,
       mf_ntree = mf_ntree,
       mice_method = mice_method,
       Method = c("Linear Regression", "Elastic Net", "MICE", "missForest"),
@@ -680,16 +1189,307 @@ evaluate_combo <- function(row_params, df = df_all,
 param_list <- split(param_grid, seq_len(nrow(param_grid)))
 
 # Use future_map_dfr with reproducible seeds
-results_all <- future_map_dfr(param_list, evaluate_combo, .options = furrr_options(seed = TRUE))
+results_all_gh <- future_map_dfr(param_list, evaluate_combo, .options = furrr_options(seed = TRUE))
 
 # Clean up: restore sequential plan if desired
 plan(sequential)
 
 # You can also inspect best combos:
-best_by_method <- results_all %>%
+best_by_method <- results_all_gh %>%
   group_by(Method) %>%
   filter(!is.na(RMSE)) %>%
   slice_min(RMSE, n = 1, with_ties = FALSE) %>%
   ungroup()
 print(best_by_method)
 ```
+Again we see that the best predictions are found by combining as many predictors as we can (in this case 25 predictors) and using a random forest prediction model, achieving a RMSE of 11.74, MAE of 8.4, and R2 of 0.63. This is not much worse than the results found by using ANOVA alone to generate categorical variables associated with the outcome variable, but it is worse than the results found using ANOVA alone to associate categorical variables (RMSE = 10.36, R2 = 0.71). 
+
+Deep learning models generally don't perform better than random forests on tabular imputation datasets like this, but just to check I've included one here. More for my sanity rather than any statistical completeness.
+
+```{r}
+# Load packages
+library(dplyr)
+library(forcats)
+library(tidyr)
+library(h2o)
+library(rstatix)
+library(tibble)
+
+# Initialize H2O once
+h2o.init(nthreads = 1, max_mem_size = "8G")
+
+# ---- CONFIG ----
+set.seed(123)
+df_all <- train_csv
+target_var <- "LotFrontage"
+
+alpha_cor <- 0.01
+alpha_gh  <- 0.01
+mask_frac <- 0.2
+
+# ---- Function ----
+evaluate_h2o_deep <- function(df,
+                              target_var = "LotFrontage",
+                              alpha_cor = 0.01,
+                              alpha_gh = 0.01,
+                              mask_frac = 0.2,
+                              min_obs_cor = 10,
+                              min_obs_per_level = 5,
+                              min_obs_anova = 20) {
+  
+  # --- Step 0: Clean and convert types ---
+  df <- df %>%
+    mutate(across(where(is.ordered), ~ factor(.x, ordered = FALSE))) %>%  # fix ordered factors
+    mutate(across(where(is.character), as.factor))                        # ensure characters are factors
+  
+  # Identify variable types
+  numeric_vars <- names(df)[sapply(df, is.numeric) & names(df) != target_var]
+  factor_vars  <- names(df)[sapply(df, is.factor)]
+
+  # --- Step 1: Select numeric predictors by correlation ---
+  selected_numeric <- c()
+  for (v in numeric_vars) {
+    idx <- which(!is.na(df[[target_var]]) & !is.na(df[[v]]))
+    if (length(idx) < min_obs_cor) next
+    ct <- tryCatch(cor.test(df[[target_var]][idx], df[[v]][idx]), error = function(e) NULL)
+    if (!is.null(ct) && !is.na(ct$p.value) && ct$p.value < alpha_cor) {
+      selected_numeric <- c(selected_numeric, v)
+    }
+  }
+
+  # --- Step 2: Select categorical predictors by Games-Howell test ---
+  selected_factors <- c()
+  for (v in factor_vars) {
+    tmp <- df %>% select(all_of(c(target_var, v))) %>% drop_na()
+    if (nrow(tmp) < min_obs_anova) next
+
+    # Collapse rare levels
+    valid_levels <- names(which(table(tmp[[v]]) >= min_obs_per_level))
+    tmp[[v]] <- fct_other(tmp[[v]], keep = valid_levels, other_level = "Other")
+    tmp[[v]] <- droplevels(tmp[[v]])
+
+    if (nlevels(tmp[[v]]) < 2) next
+
+    gh <- tryCatch(games_howell_test(as.formula(paste(target_var, "~", v)), data = tmp),
+                   error = function(e) NULL)
+    if (is.null(gh)) next
+
+    p_values <- gh$p.adj
+    p_values <- p_values[!is.na(p_values)]
+    if (length(p_values) == 0) next
+    chi_sq <- -2 * sum(log(p_values))
+    combined_p <- 1 - pchisq(chi_sq, df = 2 * length(p_values))
+    if (combined_p < alpha_gh) selected_factors <- c(selected_factors, v)
+  }
+
+  predictors <- c(selected_numeric, selected_factors)
+  if (length(predictors) == 0) stop("No predictors selected; adjust alpha thresholds.")
+
+  # --- Step 3: Prepare modeling data ---
+  model_df <- df %>% select(all_of(c(target_var, predictors))) %>% drop_na()
+
+  # Split known values
+  known_idx <- which(!is.na(model_df[[target_var]]))
+  mask_n <- max(1, round(length(known_idx) * mask_frac))
+  mask_idx <- sample(known_idx, mask_n)
+
+  train_df <- model_df[-mask_idx, ]
+  test_df  <- model_df[mask_idx, ]
+
+  true_values <- test_df[[target_var]]
+
+  # --- Step 4: Convert to H2O frames ---
+  train_h2o <- as.h2o(train_df)
+  test_h2o  <- as.h2o(test_df)
+
+  predictors <- setdiff(names(train_df), target_var)
+
+  # --- Step 5: Deep Learning model ---
+  grid_id <- paste0("dl_grid_", sample(1000:9999, 1))
+  hyper_params <- list(
+    hidden = list(c(32, 16), c(64, 32, 16), c(128, 64)),
+    activation = c("Rectifier", "Tanh", "Maxout"),
+    input_dropout_ratio = c(0, 0.1, 0.2),
+    rate = c(0.01, 0.005, 0.001)
+  )
+
+  dl_grid <- h2o.grid(
+    algorithm = "deeplearning",
+    grid_id = grid_id,
+    x = predictors,
+    y = target_var,
+    training_frame = train_h2o,
+    validation_frame = test_h2o,
+    hyper_params = hyper_params,
+    epochs = 100,
+    stopping_metric = "RMSE",
+    stopping_rounds = 5,
+    stopping_tolerance = 1e-4,
+    seed = 123,
+    standardize = TRUE
+  )
+
+  # --- Step 6: Best model and performance ---
+  grid_perf <- h2o.getGrid(grid_id, sort_by = "RMSE", decreasing = FALSE)
+  best_model_id <- grid_perf@model_ids[[1]]
+  best_dl <- h2o.getModel(best_model_id)
+
+  preds <- as.data.frame(h2o.predict(best_dl, test_h2o))[, 1]
+
+  ok <- !is.na(true_values) & !is.na(preds)
+  RMSE <- sqrt(mean((true_values[ok] - preds[ok])^2))
+  MAE  <- mean(abs(true_values[ok] - preds[ok]))
+  R2   <- cor(true_values[ok], preds[ok])^2
+
+  tibble(
+    Method = "H2O Deep Learning",
+    alpha_cor = alpha_cor,
+    alpha_gh = alpha_gh,
+    RMSE = RMSE,
+    MAE = MAE,
+    R2 = R2,
+    n_predictors = length(predictors)
+  )
+}
+
+# ---- RUN ----
+results_h2o <- evaluate_h2o_deep(df_all, alpha_cor = 0.01, alpha_gh = 0.01)
+print(results_h2o)
+
+# ---- CLEANUP ----
+h2o.shutdown(prompt = FALSE)
+```
+
+Good for confirming my sanity, the deep learning model is performing worse on predicting this data when compared to a random forest model. 
+
+Now we have our optimal prediction model and optimal parameters for this model, lets try to optimise it further. We'll start with increasing maxiter over a range, then attempt to find improvements via iterative refinement, and then evaluate individual features to see if removing them can provide improvements to the model. (note, tried this and none of it helped lmao)
+```{r}
+evaluate_ranger_imputation <- function(
+    df,
+    target_var = "LotFrontage",
+    mask_frac = 0.2,
+    min_train_rows = 30,
+    ntree = 1000,
+    mtry = NULL,
+    min_node_size = 5,
+    seed = 123
+) {
+  library(dplyr)
+  library(ranger)
+  
+  set.seed(seed)
+
+  # --- 1. Prepare data ---
+  if (!target_var %in% names(df))
+    stop("Target variable not found in dataframe.")
+  
+  # Ensure factors remain factors
+  df[] <- lapply(df, function(x) if (is.character(x)) factor(x) else x)
+
+  # Use only rows with non-missing target values
+  known_idx <- which(!is.na(df[[target_var]]))
+  if (length(known_idx) < min_train_rows + 2)
+    stop("Not enough complete cases to perform evaluation.")
+
+  # rows to mask
+  mask_n <- max(1, round(mask_frac * length(known_idx)))
+  mask_idx <- sample(known_idx, mask_n)
+
+  # Keep true values
+  true_vals <- df[[target_var]][mask_idx]
+
+  # Create masked dataset
+  df_masked <- df
+  df_masked[[target_var]][mask_idx] <- NA
+  
+  # define train/test
+  train_idx <- setdiff(known_idx, mask_idx)
+  test_idx  <- mask_idx
+
+  train_df <- df_masked[train_idx, , drop = FALSE]
+  test_df  <- df_masked[test_idx, , drop = FALSE]
+
+  # remove predictors that become all-NA or zero variance
+  usable_predictors <- setdiff(names(df), target_var)
+
+  usable_predictors <- usable_predictors[
+    sapply(usable_predictors, function(v) {
+      x <- train_df[[v]]
+      if (all(is.na(x))) return(FALSE)
+      if (is.numeric(x) && length(unique(na.omit(x))) <= 1) return(FALSE)
+      if (is.factor(x) && nlevels(droplevels(x)) <= 1) return(FALSE)
+      TRUE
+    })
+  ]
+
+  if (length(usable_predictors) == 0)
+    stop("No usable predictors remain after cleaning.")
+  usable_predictors <- intersect(usable_predictors, final_predictors)
+
+  # Keep only final predictors
+  train_df <- train_df[, c(target_var, usable_predictors), drop = FALSE]
+  test_df  <- test_df[, c(target_var, usable_predictors), drop = FALSE]
+
+  # Align factor levels in test set
+  for (col in usable_predictors) {
+    if (is.factor(train_df[[col]])) {
+      levs <- levels(droplevels(train_df[[col]]))
+      train_df[[col]] <- factor(train_df[[col]], levels = levs)
+      test_df[[col]]  <- factor(test_df[[col]],  levels = levs)
+    }
+  }
+
+  # --- 2. Fit ranger model ---
+  formula <- as.formula(paste(target_var, "~ ."))
+
+  ranger_fit <- ranger(
+    formula,
+    data = train_df,
+    num.trees = ntree,
+    mtry = if (is.null(mtry)) floor(sqrt(length(usable_predictors))) else mtry,
+    min.node.size = min_node_size,
+    importance = "impurity",
+    seed = seed
+  )
+
+  # --- 3. Predictions ---
+  pred <- predict(ranger_fit, data = test_df)$predictions
+
+  # --- 4. Metrics ---
+  ok <- !is.na(true_vals) & !is.na(pred)
+  if (sum(ok) == 0) {
+    return(list(
+      RMSE = NA, MAE = NA, R2 = NA,
+      n_predictors = length(usable_predictors),
+      n_test = length(true_vals)
+    ))
+  }
+
+  y <- true_vals[ok]
+  p <- pred[ok]
+
+  RMSE <- sqrt(mean((y - p)^2))
+  MAE  <- mean(abs(y - p))
+  R2   <- if (length(y) > 1) cor(y, p)^2 else NA
+
+  return(list(
+    RMSE = RMSE,
+    MAE = MAE,
+    R2 = R2,
+    n_predictors = length(usable_predictors),
+    n_test = length(y),
+    predictors = usable_predictors
+  ))
+}
+
+result <- evaluate_ranger_imputation(train_csv, target_var = "LotFrontage")
+
+result
+```
+```
+
+```{r}
+na_count_test
+```
+Missing data is present in the MSZoning, LotFrontage, Alley, Utilities, Exterior1st, Exterior2nd, MasVnrType, MasVnrArea, BsmtQual, BsmtCond, BsmtExposure, BsmtFinType1, BsmtFinSF1, BsmtFinType2, BsmtFinSF2, BsmtUnfSF, TotalBsmtSF, BsmtFullBath, BsmtHalfBath, KitchenQual, Functional, FireplaceQu, GarageType, GarageYrBlt, GarageFinish, GarageCars, GarageArea, GarageQual, GarageCond, PoolQC, Fence, MiscFeature, SaleType
+For the sake of consistency, we will use broadly the same methods as used in the training dataset to impute the missing values in the test dataset.
