@@ -12,7 +12,7 @@ These are the required packages for this exploration. The code should run and
 install packages if they are not installed on the local device
 
 ```{r}
-requiredPackages = c('here', 'tidyverse', 'dplyr', 'data.table', 'ggplot2', 'rstatix', 'missForest', 'Metrics', 'glmnet', 'xgboost', 'mice', 'furrr', 'ufs', 'forcats', 'randomForest', 'future.apply', 'recipes', 'caret', 'broom', 'DescTools', 'infotheo', 'tibble', 'car', 'stats', 'poolr', 'keras', 'tensorflow', 'yardstick', 'h2o', 'ranger', 'lightgbm', 'Matrix')
+requiredPackages = c('here', 'tidyverse', 'dplyr', 'data.table', 'ggplot2', 'rstatix', 'missForest', 'Metrics', 'glmnet', 'xgboost', 'mice', 'furrr', 'ufs', 'forcats', 'randomForest', 'future.apply', 'recipes', 'caret', 'broom', 'DescTools', 'infotheo', 'tibble', 'car', 'stats', 'poolr', 'keras', 'tensorflow', 'yardstick', 'h2o', 'ranger', 'lightgbm', 'Matrix', 'catboost', 'mgcv')
 for (p in requiredPackages){
   if(!require(p,character.only = TRUE)) install.packages(p)
   library(p, character.only = TRUE)}
@@ -679,10 +679,12 @@ set.seed(123)
 df_all <- train_csv
 
 # PARAM GRID (customise as needed)
-alpha_cor_values    <- c(1e-8, 1e-6, 1e-4, 1e-2, 5e-2)
-alpha_anova_values  <- c(1e-8, 1e-6, 1e-4, 1e-2, 5e-2)
+alpha_cor_values    <- c(1e-10, 1e-8, 1e-6, 1e-4, 1e-2, 5e-2)
+alpha_anova_values  <- c(1e-10, 1e-8, 1e-6, 1e-4, 1e-2, 5e-2)
 missforest_ntree    <- c(50, 100, 150, 200)
 mice_methods        <- c("cart")        # keep small list to limit runtime
+
+best_rmse <- NULL
 
 # parallel plan: use most cores but leave one free
 workers_to_use <- max(1, future::availableCores() - 1)
@@ -884,10 +886,11 @@ evaluate_combo <- function(row_params, df = df_all,
       list(n = sum(ok), RMSE = sqrt(mean((t - p)^2)), MAE = mean(abs(t - p)), R2 = if (length(t) > 1) cor(t, p)^2 else NA_real_)
     }
     
+    
     res_lm   <- eval_metrics(true_values, lm_pred)
     res_mice <- eval_metrics(true_values, mice_pred)
     res_mf   <- eval_metrics(true_values, mf_pred)
-    
+
     # Compose results tibble for this combination
     result_tib <- tibble::tibble(
       alpha_cor = alpha_cor,
@@ -944,7 +947,7 @@ df_all <- train_csv
 # PARAM GRID (customise as needed)
 alpha_cor_values    <- c(1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-2, 5e-2)
 alpha_gh_values     <- c(1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-2, 5e-2, 1e-1)
-missforest_ntree    <- c(50, 100, 150, 200, 250, 300, 350, 400)
+missforest_ntree    <- c(10, 25, 50, 100, 150, 200, 250, 300, 350, 400)
 mice_methods        <- c("cart")        # keep small list to limit runtime
 
 # parallel plan: use most cores but leave one free
@@ -964,7 +967,7 @@ param_grid <- expand.grid(
 evaluate_combo <- function(row_params, df = df_all,
                            target_var = "LotFrontage",
                            mask_frac = 0.20,
-                           min_obs_per_level = 5,
+                           min_obs_per_level = 10,
                            min_obs_cor = 10,
                            min_obs_anova = 20,
                            min_rows_train = 30,
@@ -1202,7 +1205,7 @@ best_by_method <- results_all_gh %>%
   ungroup()
 print(best_by_method)
 ```
-Again we see that the best predictions are found by combining as many predictors as we can (in this case 25 predictors) and using a random forest prediction model, achieving a RMSE of 11.74, MAE of 8.4, and R2 of 0.63. This is not much worse than the results found by using ANOVA alone to generate categorical variables associated with the outcome variable, but it is worse than the results found using ANOVA alone to associate categorical variables (RMSE = 10.36, R2 = 0.71). 
+Again we see that the best predictions are found by combining as many predictors as we can (in this case 25 predictors) and using a random forest prediction model, achieving a RMSE of 11.42, MAE of 7.64, and R2 of 0.69. This is not much worse than the results found by using ANOVA alone to generate categorical variables associated with the outcome variable, but it is worse than the results found using ANOVA alone to associate categorical variables (RMSE = 10.28, R2 = 0.72). 
 
 Deep learning models generally don't perform better than random forests on tabular imputation datasets like this, but just to check I've included one here. More for my sanity rather than any statistical completeness.
 
@@ -1362,130 +1365,1759 @@ h2o.shutdown(prompt = FALSE)
 
 Good for confirming my sanity, the deep learning model is performing worse on predicting this data when compared to a random forest model. 
 
-Now we have our optimal prediction model and optimal parameters for this model, lets try to optimise it further. We'll start with increasing maxiter over a range, then attempt to find improvements via iterative refinement, and then evaluate individual features to see if removing them can provide improvements to the model. (note, tried this and none of it helped lmao)
+Now we have our optimal prediction model and optimal parameters for this model, lets try to optimise it further. We'll look at the results that are particularly inaccurate and try to see if there are any patterns to those.
+
+
 ```{r}
-evaluate_ranger_imputation <- function(
-    df,
-    target_var = "LotFrontage",
-    mask_frac = 0.2,
-    min_train_rows = 30,
-    ntree = 1000,
-    mtry = NULL,
-    min_node_size = 5,
-    seed = 123
-) {
-  library(dplyr)
-  library(ranger)
+set.seed(123)
+
+# Use your dataframe name
+df_all <- train_csv
+
+# PARAM GRID (customise as needed)
+alpha_cor_values    <- c(1e-10, 1e-8, 1e-6, 1e-4, 1e-2, 5e-2)
+alpha_anova_values  <- c(1e-10, 1e-8, 1e-6, 1e-4, 1e-2, 5e-2)
+missforest_ntree    <- c(50, 100, 150, 200)
+mice_methods        <- c("cart")        # keep small list to limit runtime
+
+collapse_rare_levels <- function(df, factor_vars, min_obs ) {
+  for (v in factor_vars) {
+    if (!is.factor(df[[v]])) next
+
+    tbl <- table(df[[v]])
+    rare_levels <- names(tbl)[tbl < min_obs]
+
+    if (length(rare_levels) > 0) {
+      df[[v]] <- forcats::fct_collapse(
+        df[[v]],
+        Other = rare_levels
+      )
+      df[[v]] <- droplevels(df[[v]])
+    }
+  }
+  df
+}
+
+# parallel plan: use most cores but leave one free
+workers_to_use <- max(1, future::availableCores() - 1)
+plan(multisession, workers = workers_to_use)
+
+# make grid as a data.frame of combos
+param_grid <- expand.grid(
+  alpha_cor = alpha_cor_values,
+  alpha_anova = alpha_anova_values,
+  mf_ntree = missforest_ntree,
+  mice_method = mice_methods,
+  stringsAsFactors = FALSE
+)
+
+# The core evaluator
+evaluate_combo <- function(row_params, df = df_all,
+                           target_var = "LotFrontage",
+                           mask_frac = 0.20,
+                           min_obs_per_level = 10,
+                           min_obs_cor = 10,
+                           min_obs_anova = 20,
+                           min_rows_train = 30,
+                           max_mask_attempts = 200) {
+
+  # capture parameters
+  alpha_cor   <- row_params$alpha_cor
+  alpha_anova <- row_params$alpha_anova
+  mf_ntree    <- row_params$mf_ntree
+  mice_method <- row_params$mice_method
   
-  set.seed(seed)
+  # wrap in tryCatch so a single failing combo returns NA row
+  tryCatch({
+    df <- df  # use df_all by default
+    
+    # Identify factor variables among selected predictors
+    all_factor_vars <- names(df)[sapply(df, is.factor)]
 
-  # --- 1. Prepare data ---
-  if (!target_var %in% names(df))
-    stop("Target variable not found in dataframe.")
-  
-  # Ensure factors remain factors
-  df[] <- lapply(df, function(x) if (is.character(x)) factor(x) else x)
-
-  # Use only rows with non-missing target values
-  known_idx <- which(!is.na(df[[target_var]]))
-  if (length(known_idx) < min_train_rows + 2)
-    stop("Not enough complete cases to perform evaluation.")
-
-  # rows to mask
-  mask_n <- max(1, round(mask_frac * length(known_idx)))
-  mask_idx <- sample(known_idx, mask_n)
-
-  # Keep true values
-  true_vals <- df[[target_var]][mask_idx]
-
-  # Create masked dataset
-  df_masked <- df
-  df_masked[[target_var]][mask_idx] <- NA
-  
-  # define train/test
-  train_idx <- setdiff(known_idx, mask_idx)
-  test_idx  <- mask_idx
-
-  train_df <- df_masked[train_idx, , drop = FALSE]
-  test_df  <- df_masked[test_idx, , drop = FALSE]
-
-  # remove predictors that become all-NA or zero variance
-  usable_predictors <- setdiff(names(df), target_var)
-
-  usable_predictors <- usable_predictors[
-    sapply(usable_predictors, function(v) {
-      x <- train_df[[v]]
-      if (all(is.na(x))) return(FALSE)
-      if (is.numeric(x) && length(unique(na.omit(x))) <= 1) return(FALSE)
-      if (is.factor(x) && nlevels(droplevels(x)) <= 1) return(FALSE)
+    # Collapse rare levels BEFORE selecting predictor-complete rows
+    df <- collapse_rare_levels(df, all_factor_vars, min_obs = min_obs_per_level)
+    
+    # select numeric predictors by correlation 
+    selected_numeric <- results_table_numeric$Variable[results_table_numeric$P_value < alpha_cor]
+   
+    # select factor predictors by ANOVA 
+    selected_factors <- results_table_anova$Variable[results_table_anova$P_value < alpha_anova]
+    
+    selected_predictors <- c(selected_numeric, selected_factors)
+    if (length(selected_predictors) == 0) {
+      # Return parameter settings
+      return(sprintf('No predictors found at p_values of %d for correlation and %s for ANOVA. Please adjust these values and try again', alpha_cor, alpha_anova))
+    }
+    
+    # keep only rows where predictors are complete (fair comparison) --
+    predictor_complete_idx <- complete.cases(df[, selected_predictors, drop = FALSE])
+    model_df <- df[predictor_complete_idx, c(target_var, selected_predictors), drop = FALSE]
+    
+    
+    
+    # known indices (where target known)
+    known_idx <- which(!is.na(model_df[[target_var]]))
+    if (length(known_idx) < (min_rows_train + 2)) {
+      # not enough data to evaluate this combo properly -> return NA results
+      return(tibble(
+        alpha_cor = alpha_cor, alpha_anova = alpha_anova,
+        en_alpha = en_alpha, mf_ntree = mf_ntree, mice_method = mice_method,
+        Method = c("Linear Regression", "Elastic Net", "MICE", "missForest"),
+        RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_, n_predictors = length(selected_predictors)
+      ))
+    }
+    
+    # mask creation (ensure training retains factor levels) --
+    mask_n <- max(1, round(length(known_idx) * mask_frac))
+    attempt <- 1
+    mask_indices_final <- NULL
+    
+    # helper for mask validity
+    # checks there are enough levels in the factors present 
+    valid_mask <- function(mask_idx, df_model, factor_predictors) {
+      train_idx <- setdiff(which(!is.na(df_model[[target_var]])), mask_idx)
+      if (length(train_idx) < min_rows_train) return(FALSE)
+      for (f in factor_predictors) {
+        if (!is.factor(df_model[[f]])) next
+        nlev <- nlevels(droplevels(df_model[[f]][train_idx]))
+        if (nlev < 2) return(FALSE)
+      }
       TRUE
+    }
+    
+    factor_preds_in_selected <- selected_factors[selected_factors %in% selected_predictors]
+    
+    while (attempt <= max_mask_attempts) {
+      mask_idx_try <- sample(known_idx, mask_n)
+      if (valid_mask(mask_idx_try, model_df, factor_preds_in_selected)) {
+        mask_indices_final <- mask_idx_try
+        break
+      }
+      attempt <- attempt + 1
+    }
+    if (is.null(mask_indices_final)) {
+      # fallback try smaller mask fractions
+      found <- FALSE
+      for (mf in seq(mask_frac/2, 0.02, by = -0.01)) {
+        mask_n2 <- max(1, round(length(known_idx) * mf))
+        attempt2 <- 1
+        while(attempt2 <= max_mask_attempts) {
+          mask_idx_try <- sample(known_idx, mask_n2)
+          if (valid_mask(mask_idx_try, model_df, factor_preds_in_selected)) {
+            mask_indices_final <- mask_idx_try
+            found <- TRUE
+            break
+          }
+          attempt2 <- attempt2 + 1
+        }
+        if (found) break
+      }
+    }
+    
+    # Prepare masked dataframe 
+    df_model_masked <- model_df
+    true_values <- df_model_masked[[target_var]][mask_indices_final]
+    df_model_masked[[target_var]][mask_indices_final] <- NA  # mask
+    
+    train_idx <- which(!is.na(df_model_masked[[target_var]]))
+    test_idx  <- mask_indices_final
+    
+    # Drop single-level factors or constant numerics in training
+    final_predictors <- selected_predictors
+    if (length(selected_factors) > 0) {
+      for (f in selected_factors) {
+        if (f %in% final_predictors) {
+          nlev_train <- nlevels(droplevels(df_model_masked[[f]][train_idx]))
+          if (nlev_train < 2) {
+            final_predictors <- setdiff(final_predictors, f)
+          }
+        }
+      }
+    }
+    for (nvar in selected_numeric) {
+      if (nvar %in% final_predictors) {
+        if (var(df_model_masked[[nvar]][train_idx], na.rm = TRUE) == 0) {
+          final_predictors <- setdiff(final_predictors, nvar)
+        }
+      }
+    }
+    
+    # Build train/test frames
+    train_df_reg <- df_model_masked[train_idx, c(target_var, final_predictors), drop = FALSE]
+    test_df_reg  <- df_model_masked[test_idx,  c(target_var, final_predictors), drop = FALSE]
+    
+    # Align factor levels: set test levels to training levels (prevents "new levels" error)
+    for (f in final_predictors) {
+      if (is.factor(train_df_reg[[f]])) {
+        levs <- levels(droplevels(train_df_reg[[f]]))
+        train_df_reg[[f]] <- factor(train_df_reg[[f]], levels = levs)
+        test_df_reg[[f]]  <- factor(test_df_reg[[f]], levels = levs)  # unseen => NA (safe)
+      }
+    }
+    
+    # -------- Linear regression --------
+    lm_pred <- rep(NA_real_, length(test_idx))
+    lm_success <- FALSE
+    if (nrow(train_df_reg) >= 5 && length(final_predictors) > 0) {
+      lm_formula <- as.formula(paste(target_var, "~", paste(final_predictors, collapse = " + ")))
+      lm_fit <- tryCatch(lm(lm_formula, data = train_df_reg), error = function(e) e)
+      if (!inherits(lm_fit, "error")) {
+        # predict; rows with NA predictors will produce NA predictions
+        lm_pred <- tryCatch(predict(lm_fit, newdata = test_df_reg), error = function(e) rep(NA_real_, nrow(test_df_reg)))
+        lm_success <- TRUE
+      }
+    }
+    
+    # -------- MICE (masking already done in test_df_reg: LotFrontage is NA in test rows) --------
+    mice_pred <- rep(NA_real_, length(test_idx))
+    mice_success <- FALSE
+    # Combine train+test (with test's LotFrontage currently NA) and impute
+    combined_for_mice <- rbind(train_df_reg, test_df_reg)
+    mice_result <- tryCatch(mice(combined_for_mice, m = 1, maxit = 5, method = mice_method, printFlag = FALSE),
+                            error = function(e) NULL)
+    if (!is.null(mice_result)) {
+      mice_imputed <- complete(mice_result)
+      ntr <- nrow(train_df_reg)
+      mice_test  <- mice_imputed[(ntr + 1):nrow(mice_imputed), , drop = FALSE]
+      mice_pred <- mice_test[[target_var]]
+      mice_success <- TRUE
+    }
+    
+    # -------- missForest (masking already done in test_df_reg) --------
+    mf_pred <- rep(NA_real_, length(test_idx))
+    mf_success <- FALSE
+    combined_for_mf <- rbind(train_df_reg, test_df_reg)
+    # ensure types are appropriate; missForest expects factors as factors and numerics numeric
+    mf_out <- tryCatch(missForest(combined_for_mf, maxiter = 10, ntree = mf_ntree, verbose = TRUE),
+                       error = function(e) NULL)
+    if (!is.null(mf_out)) {
+      mf_imputed <- mf_out$ximp
+      ntr <- nrow(train_df_reg)
+      mf_pred <- mf_imputed[[target_var]][(ntr + 1):nrow(mf_imputed)]
+      mf_success <- TRUE
+    }
+    
+    # --- STORE ALL RAW PREDICTIONS FOR LATER ANALYSIS ---
+  all_predictions <- tibble::tibble(
+    index = mask_indices_final,
+    true = true_values,
+    pred_lm = lm_pred,
+    pred_mice = mice_pred,
+    pred_mf = mf_pred
+  )
+    
+    # Evaluate metrics using the true_values vector and each predicted vector
+    eval_metrics <- function(true, pred) {
+      ok <- !is.na(true) & !is.na(pred)
+      if (sum(ok) == 0) return(list(n = 0, RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_))
+      t <- true[ok]; p <- pred[ok]
+      list(n = sum(ok), RMSE = sqrt(mean((t - p)^2)), MAE = mean(abs(t - p)), R2 = if (length(t) > 1) cor(t, p)^2 else NA_real_)
+    }
+    
+    
+    res_lm   <- eval_metrics(true_values, lm_pred)
+    res_mice <- eval_metrics(true_values, mice_pred)
+    res_mf   <- eval_metrics(true_values, mf_pred)
+    # Determine best model by RMSE
+    rmse_vec <- c(res_lm$RMSE, res_mice$RMSE, res_mf$RMSE)
+    names(rmse_vec) <- c("lm", "mice", "mf")
+
+    best_method <- names(which.min(rmse_vec))
+    best_pred_vector <- switch(best_method,
+                           lm = lm_pred,
+                           mice = mice_pred,
+                           mf = mf_pred)
+
+    best_prediction <- tibble::tibble(
+      index = mask_indices_final,
+      true = true_values,
+      pred = best_pred_vector,
+      abs_error = abs(true_values - best_pred_vector),
+      method = best_method
+  )
+
+    # Compose results tibble for this combination
+    result_tib <- tibble::tibble(
+      alpha_cor = alpha_cor,
+      alpha_anova = alpha_anova,
+      mf_ntree = mf_ntree,
+      mice_method = mice_method,
+      Method = c("Linear Regression", "MICE", "missForest"),
+      RMSE = c(res_lm$RMSE, res_mice$RMSE, res_mf$RMSE),
+      MAE  = c(res_lm$MAE, res_mice$MAE, res_mf$MAE),
+      R2   = c(res_lm$R2, res_mice$R2, res_mf$R2),
+      n_predictors = length(final_predictors)
+    )
+    
+    return(list(
+      test_df = test_df_reg,
+      metrics_table = result_tib,
+      all_predictions = all_predictions,
+      best_prediction = best_prediction,
+      n_predictors = length(final_predictors)
+    ))
+    
+  }, error = function(e) {
+    # On error, return NA result with the parameters
+    tibble::tibble(
+      alpha_cor = alpha_cor,
+      alpha_anova = alpha_anova,
+      mf_ntree = mf_ntree,
+      mice_method = mice_method,
+      Method = c("Linear Regression", "Elastic Net", "MICE", "missForest"),
+      RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_,
+      n_predictors = NA_integer_
+    )
+  })
+}
+
+# Run grid in parallel (use reproducible random seeds)
+# convert each row of param_grid to a list for mapping
+param_list <- split(param_grid, seq_len(nrow(param_grid)))
+
+# 1) Run the grid producing a list of results (each element is a list returned by evaluate_combo)
+results_list <- future_map(param_list, evaluate_combo, .options = furrr_options(seed = TRUE))
+
+# 2) Remove any NULL or error-return entries safely
+# (If evaluate_combo returned a tibble on error, adjust the filter accordingly)
+valid_results <- keep(results_list, ~ !is.null(.x) && is.list(.x))
+
+# 3) Extract metrics: this binds all metrics_table tibbles into one long tibble
+metrics_all <- map_dfr(valid_results, function(res) {
+  # res$metrics_table should be a tibble (possibly with multiple rows: one per method)
+  if (is.null(res$metrics_table)) return(NULL)
+  # ensure it includes the parameter columns (alpha_cor etc.)
+  as_tibble(res$metrics_table)
+}, .id = "combo_id")   # optional combo id if you want
+
+
+
+# Now you have:
+# metrics_all        : tibble of metrics (many rows; each row = one method entry returned by evaluate_combo)
+
+
+# Example: inspect top-performing combos by RMSE
+best_by_combo <- metrics_all %>%
+  group_by(alpha_cor, alpha_anova, mf_ntree, mice_method, Method) %>%
+  summarise(RMSE = mean(RMSE, na.rm = TRUE), .groups = "drop") %>%
+  arrange(RMSE) %>%
+  slice_head(n = 20)
+
+print(best_by_combo)
+
+
+
+```
+
+Collapsing rare levels does provide an improvement in RMSE, but only a very small one (10.28 vs 10.23). Still, we now have a list of best predictions, so we'll examine the predictions there that were particularly inaccurate and see if any trend is possible for identifying the subset of inaccurate predictions. Even looking at those results which were more than one SD greater than the mean error, we're only examining the worst 10% of predictions.
+
+```{r}
+best_prediction <- valid_results[[56]]$best_prediction
+
+
+histogram(best_prediction$abs_error)
+analyse_bad_predictions <- function(df_all,
+                                    predictions,
+                                    true_values,
+                                    predictors,
+                                    n_sd = 1,
+                                    p_thresh = 0.05) {
+  suppressPackageStartupMessages({
+    library(dplyr)
+    library(tibble)
+    library(stats)
+  })
+
+  # ---------------------------
+  # 1. Compute prediction error
+  # ---------------------------
+  err <- predictions - true_values
+  mu  <- mean(err, na.rm = TRUE)
+  sdv <- sd(err, na.rm = TRUE)
+
+  bad_idx <- which(err > mu + n_sd * sdv)
+
+  if (length(bad_idx) == 0) {
+    message("No bad predictions detected.")
+    return(NULL)
+  }
+
+  bad_data  <- df_all[bad_idx, predictors, drop = FALSE]
+  good_data <- df_all[-bad_idx, predictors, drop = FALSE]
+
+  # ---------------------------
+  # 2. Numeric predictors
+  # ---------------------------
+  numeric_vars <- names(bad_data)[sapply(bad_data, is.numeric)]
+  numeric_summary <- NULL
+
+  if (length(numeric_vars) > 0) {
+    numeric_summary <- lapply(numeric_vars, function(v) {
+      bad_mean  <- mean(bad_data[[v]], na.rm = TRUE)
+      good_mean <- mean(good_data[[v]], na.rm = TRUE)
+      tibble(
+        Variable = v,
+        Mean_Bad = bad_mean,
+        Mean_Good = good_mean,
+        Mean_Diff = bad_mean - good_mean
+      )
+    }) |> bind_rows()
+  }
+
+  # ---------------------------
+  # 3. Factor predictors
+  # ---------------------------
+  factor_vars <- names(bad_data)[sapply(bad_data, is.factor)]
+  factor_summary <- list()
+
+  for (v in factor_vars) {
+    full_tab <- table(df_all[[v]])
+    bad_tab  <- table(bad_data[[v]])
+    good_tab <- table(good_data[[v]])
+
+    full_prop <- full_tab / sum(full_tab)
+    bad_prop  <- bad_tab / sum(bad_tab)
+
+    all_levels <- union(names(full_tab), names(bad_tab))
+    full_prop <- full_prop[all_levels]
+    bad_prop  <- bad_prop[all_levels]
+    full_prop[is.na(full_prop)] <- 0
+    bad_prop[is.na(bad_prop)] <- 0
+
+    over_rep <- bad_prop - full_prop
+
+    # ---- Statistical significance ----
+    p_values <- sapply(all_levels, function(lvl) {
+      # Construct 2x2 table for chi-squared or Fisher test
+      bad_yes <- sum(bad_data[[v]] == lvl, na.rm = TRUE)
+      bad_no  <- nrow(bad_data) - bad_yes
+      good_yes <- sum(good_data[[v]] == lvl, na.rm = TRUE)
+      good_no  <- nrow(good_data) - good_yes
+
+      tbl <- matrix(c(bad_yes, bad_no, good_yes, good_no), nrow = 2, byrow = TRUE)
+
+      # Use Fisher's test if any expected count < 5
+      if (any(tbl < 5)) {
+        test <- tryCatch(fisher.test(tbl)$p.value, error = function(e) NA)
+      } else {
+        test <- tryCatch(chisq.test(tbl, correct = FALSE)$p.value, error = function(e) NA)
+      }
+      test
     })
-  ]
 
-  if (length(usable_predictors) == 0)
-    stop("No usable predictors remain after cleaning.")
-  usable_predictors <- intersect(usable_predictors, final_predictors)
+    factor_summary[[v]] <- tibble(
+      Variable = v,
+      Level = all_levels,
+      Prop_Bad = as.numeric(bad_prop),
+      Prop_All = as.numeric(full_prop),
+      Over_Rep = as.numeric(over_rep),
+      P_value = p_values
+    )
+  }
 
-  # Keep only final predictors
-  train_df <- train_df[, c(target_var, usable_predictors), drop = FALSE]
-  test_df  <- test_df[, c(target_var, usable_predictors), drop = FALSE]
+  # ---------------------------
+  # 4. Generate text summary
+  # ---------------------------
+  text_lines <- c()
 
-  # Align factor levels in test set
-  for (col in usable_predictors) {
-    if (is.factor(train_df[[col]])) {
-      levs <- levels(droplevels(train_df[[col]]))
-      train_df[[col]] <- factor(train_df[[col]], levels = levs)
-      test_df[[col]]  <- factor(test_df[[col]],  levels = levs)
+  # Numeric summary
+  if (!is.null(numeric_summary)) {
+    big_shifts <- numeric_summary %>%
+      arrange(desc(abs(Mean_Diff))) %>%
+      head(3)
+
+    for (i in seq_len(nrow(big_shifts))) {
+      txt <- sprintf(
+        "- %s differs between bad and good predictions (Δ = %.2f)",
+        big_shifts$Variable[i], big_shifts$Mean_Diff[i]
+      )
+      text_lines <- c(text_lines, txt)
     }
   }
 
-  # --- 2. Fit ranger model ---
-  formula <- as.formula(paste(target_var, "~ ."))
+  # Factor summary (only significant over-representations)
+  for (v in names(factor_summary)) {
+    tab <- factor_summary[[v]] %>%
+      filter(P_value < p_thresh) %>%
+      arrange(desc(Over_Rep))
 
-  ranger_fit <- ranger(
-    formula,
-    data = train_df,
-    num.trees = ntree,
-    mtry = if (is.null(mtry)) floor(sqrt(length(usable_predictors))) else mtry,
-    min.node.size = min_node_size,
-    importance = "impurity",
-    seed = seed
-  )
-
-  # --- 3. Predictions ---
-  pred <- predict(ranger_fit, data = test_df)$predictions
-
-  # --- 4. Metrics ---
-  ok <- !is.na(true_vals) & !is.na(pred)
-  if (sum(ok) == 0) {
-    return(list(
-      RMSE = NA, MAE = NA, R2 = NA,
-      n_predictors = length(usable_predictors),
-      n_test = length(true_vals)
-    ))
+    if (nrow(tab) > 0) {
+      top <- head(tab, 1)
+      txt <- sprintf(
+        "- Factor %s: Level '%s' is significantly over-represented among bad predictions (%.2f%% vs %.2f%%, p = %.3f)",
+        top$Variable[1],
+        top$Level[1],
+        100 * top$Prop_Bad[1],
+        100 * top$Prop_All[1],
+        top$P_value[1]
+      )
+      text_lines <- c(text_lines, txt)
+    }
   }
 
-  y <- true_vals[ok]
-  p <- pred[ok]
+  # ---------------------------
+  # Final return
+  # ---------------------------
+  list(
+    bad_indices = bad_idx,
+    bad_data = bad_data,
+    numeric_summary = numeric_summary,
+    factor_summary = factor_summary,
+    text_summary = paste(text_lines, collapse = "\n")
+  )
+}
 
-  RMSE <- sqrt(mean((y - p)^2))
-  MAE  <- mean(abs(y - p))
-  R2   <- if (length(y) > 1) cor(y, p)^2 else NA
+   
+diagnostic <- analyse_bad_predictions(df_all, predictions = best_prediction$pred, true_values = best_prediction$true, predictors = names(df_all), n_sd = 1, p_thresh = 0.1)
+cat(diagnostic$text_summary)
+```
+We can see a few variables which are over-represented in the inaccurate predictions. SalePrice and ID are clearly not useful so will not be used, but other variables (LotArea, LandContour, Neighborhood, RoofStyle, Exterior1st, Exterior2nd, BsmtExposure, BsmtFinType1, Electrical, Fence, MoSold) are useful variables to be used in diagnosing the bad predictions. Let's further examine these inaccurate predictions.
+```{r}
+n_sd <- 0.5
+mean_error <- mean(best_prediction$abs_error)
+sd_error <- sd(best_prediction$abs_error)
+threshold <- mean_error + (n_sd * sd_error)
+best_prediction$is_bad <- best_prediction$abs_error > threshold
+
+good_prediction <- subset(best_prediction, is_bad == FALSE)
+bad_prediction <- subset(best_prediction, is_bad == TRUE)
+```
+Here we can see that there is a very small number of very bad predictions, with n_sd = 3, there are 8 bad predictions, with n_sd = 2, there are 13 bad predictions, with n_sd = 1, there are 29 bad predictions, with n_sd = 0.5, there are 43 bad predictions. We'll try to look at these results specifically and see how we can improve these predictions. 
+
+We'll first try different models for these predictions
+```{r}
+evaluate_combo <- function(row_params, df = df_all,
+                           target_var = "LotFrontage",
+                           mask_frac = 0.20,
+                           min_obs_per_level = 10,
+                           min_obs_cor = 10,
+                           min_obs_anova = 20,
+                           min_rows_train = 30,
+                           max_mask_attempts = 200,
+                           cv_folds = 5,
+                           hard_resid_sd_mult = 1.5,
+                           specialist_min_rows = 20,
+                           specialist_prob_threshold = 0.5,
+                           mf_ntree = 100,
+                           xgb_nrounds = 100,
+                           verbose = FALSE) {
+  # Required packages
+  requireNamespace("dplyr"); requireNamespace("forcats"); requireNamespace("tibble")
+  requireNamespace("purrr"); requireNamespace("missForest"); requireNamespace("xgboost")
+  requireNamespace("randomForest")
+  library(dplyr); library(forcats); library(tibble); library(purrr)
+
+  # helpers -------------------------------------------------------------------
+
+  # safe rbind that aligns columns and factor levels
+  safe_rbind <- function(a, b) {
+    all_cols <- union(names(a), names(b))
+    add_missing <- function(df, cols) {
+      for (cc in cols) if (!(cc %in% names(df))) df[[cc]] <- NA
+      df[, cols, drop = FALSE]
+    }
+    a2 <- add_missing(a, all_cols)
+    b2 <- add_missing(b, all_cols)
+    # align factor levels
+    for (col in all_cols) {
+      if (is.factor(a2[[col]]) || is.factor(b2[[col]])) {
+        levs <- union(if (is.factor(a2[[col]])) levels(a2[[col]]) else NULL,
+                      if (is.factor(b2[[col]])) levels(b2[[col]]) else NULL)
+        if (is.factor(a2[[col]])) a2[[col]] <- factor(a2[[col]], levels = levs) else a2[[col]] <- factor(a2[[col]], levels = levs)
+        if (is.factor(b2[[col]])) b2[[col]] <- factor(b2[[col]], levels = levs) else b2[[col]] <- factor(b2[[col]], levels = levs)
+      }
+    }
+    rbind(a2, b2)
+  }
+
+  # collapse rare levels in specified factor vars (used AFTER masking)
+  collapse_rare_levels <- function(df_local, factor_vars, min_obs) {
+    for (v in factor_vars) {
+      if (! (v %in% names(df_local))) next
+      if (!is.factor(df_local[[v]])) next
+      tbl <- table(df_local[[v]])
+      rare_levels <- names(tbl)[tbl < min_obs]
+      if (length(rare_levels) > 0) {
+        df_local[[v]] <- forcats::fct_collapse(df_local[[v]], Other = rare_levels)
+        df_local[[v]] <- droplevels(df_local[[v]])
+      }
+    }
+    df_local
+  }
+
+  # rmse/mae/r2 evaluator
+  eval_metrics <- function(true, pred) {
+    ok <- !is.na(true) & !is.na(pred)
+    if (sum(ok) == 0) return(list(n = 0, RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_))
+    t <- true[ok]; p <- pred[ok]
+    list(n = sum(ok), RMSE = sqrt(mean((t - p)^2)), MAE = mean(abs(t - p)), R2 = if (length(t) > 1) cor(t, p)^2 else NA_real_)
+  }
+
+  # parameters from row
+  alpha_cor   <- row_params$alpha_cor %||% row_params$alpha_cor
+  alpha_anova <- row_params$alpha_anova %||% row_params$alpha_anova
+  # allow mf_ntree from row_params too
+  if (!is.null(row_params$mf_ntree)) mf_ntree <- row_params$mf_ntree
+
+  # main tryCatch to ensure consistent return on error
+  tryCatch({
+
+    # 1) Predictor selection (unchanged: assuming you have results_table_numeric / anova available)
+    selected_numeric <- results_table_numeric$Variable[results_table_numeric$P_value < alpha_cor]
+    selected_factors <- results_table_anova$Variable[results_table_anova$P_value < alpha_anova]
+    selected_predictors <- c(selected_numeric, selected_factors)
+
+    if (length(selected_predictors) == 0) {
+      return(list(metrics_table = tibble::tibble(
+        alpha_cor = alpha_cor, alpha_anova = alpha_anova, Method = c("missForest_two_stage", "xgboost"),
+        RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_
+      ), all_predictions = NULL))
+    }
+
+    # 2) Restrict to rows with predictors present (complete cases on predictors)
+    predictor_complete_idx <- complete.cases(df[, selected_predictors, drop = FALSE])
+    model_df <- df[predictor_complete_idx, c(target_var, selected_predictors), drop = FALSE]
+
+    # 3) Known indices for target
+    known_idx <- which(!is.na(model_df[[target_var]]))
+    if (length(known_idx) < (min_rows_train + 2)) {
+      return(list(metrics_table = tibble::tibble(
+        alpha_cor = alpha_cor, alpha_anova = alpha_anova, Method = c("missForest_two_stage", "xgboost"),
+        RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_
+      ), all_predictions = NULL))
+    }
+
+    # 4) Mask selection (keep same logic as before)
+    mask_n <- max(1, round(length(known_idx) * mask_frac))
+    attempt <- 1
+    mask_indices_final <- NULL
+
+    valid_mask <- function(mask_idx, df_model, factor_predictors) {
+      train_idx <- setdiff(which(!is.na(df_model[[target_var]])), mask_idx)
+      if (length(train_idx) < min_rows_train) return(FALSE)
+      for (f in factor_predictors) {
+        if (!is.factor(df_model[[f]])) next
+        nlev <- nlevels(droplevels(df_model[[f]][train_idx]))
+        if (nlev < 2) return(FALSE)
+      }
+      TRUE
+    }
+    factor_preds_in_selected <- selected_factors[selected_factors %in% selected_predictors]
+
+    while (attempt <= max_mask_attempts) {
+      mask_idx_try <- sample(known_idx, mask_n)
+      if (valid_mask(mask_idx_try, model_df, factor_preds_in_selected)) {
+        mask_indices_final <- mask_idx_try
+        break
+      }
+      attempt <- attempt + 1
+    }
+    if (is.null(mask_indices_final)) {
+      found <- FALSE
+      for (mf_try in seq(mask_frac/2, 0.02, by = -0.01)) {
+        mask_n2 <- max(1, round(length(known_idx) * mf_try))
+        attempt2 <- 1
+        while (attempt2 <= max_mask_attempts) {
+          mask_idx_try <- sample(known_idx, mask_n2)
+          if (valid_mask(mask_idx_try, model_df, factor_preds_in_selected)) {
+            mask_indices_final <- mask_idx_try
+            found <- TRUE
+            break
+          }
+          attempt2 <- attempt2 + 1
+        }
+        if (found) break
+      }
+    }
+    if (is.null(mask_indices_final)) stop("Unable to find a valid mask that preserves factor levels")
+
+    # 5) Prepare masked df, BUT per option B we will collapse rare levels only AFTER masking
+    df_model_masked <- model_df
+    true_values_orig <- df_model_masked[[target_var]][mask_indices_final]
+    df_model_masked[[target_var]][mask_indices_final] <- NA
+    train_idx <- which(!is.na(df_model_masked[[target_var]]))
+    test_idx  <- mask_indices_final
+
+    # 6) Now collapse rare factor levels on the masked subset (both train + test together)
+    factor_vars_here <- intersect(selected_factors, names(df_model_masked))
+    if (length(factor_vars_here) > 0) {
+      df_model_masked <- collapse_rare_levels(df_model_masked, factor_vars_here, min_obs_per_level)
+    }
+
+    # 7) Drop single-level factors / constant numerics after collapsing
+    final_predictors <- selected_predictors
+    if (length(selected_factors) > 0) {
+      for (f in selected_factors) {
+        if (f %in% final_predictors) {
+          nlev_train <- nlevels(droplevels(df_model_masked[[f]][train_idx]))
+          if (nlev_train < 2) final_predictors <- setdiff(final_predictors, f)
+        }
+      }
+    }
+    for (nvar in selected_numeric) {
+      if (nvar %in% final_predictors) {
+        if (var(df_model_masked[[nvar]][train_idx], na.rm = TRUE) == 0) final_predictors <- setdiff(final_predictors, nvar)
+      }
+    }
+    if (length(final_predictors) == 0) stop("No valid predictors remain for modeling after collapsing / dropping constants")
+
+    # 8) Build train/test frames with final_predictors
+    train_df_reg <- df_model_masked[train_idx, c(target_var, final_predictors), drop = FALSE]
+    test_df_reg  <- df_model_masked[test_idx,  c(target_var, final_predictors), drop = FALSE]
+
+    # align factor levels
+    for (f in final_predictors) {
+      if (is.factor(train_df_reg[[f]])) {
+        levs <- levels(droplevels(train_df_reg[[f]]))
+        train_df_reg[[f]] <- factor(train_df_reg[[f]], levels = levs)
+        test_df_reg[[f]]  <- factor(test_df_reg[[f]], levels = levs)
+      }
+    }
+
+    # 9) Create LF_log target column in train; test LF_log is NA
+    train_df_reg$LF_log <- log1p(train_df_reg[[target_var]])
+    test_df_reg$LF_log <- NA_real_
+
+    # helper to build combined matrix for missForest (train + test)
+    build_combined_for_impute <- function(train_block, test_block, keep_cols) {
+      # select keep_cols present
+      keep_cols_present <- keep_cols[keep_cols %in% names(train_block)]
+      train_sel <- train_block[, keep_cols_present, drop = FALSE]
+      test_sel  <- test_block[, keep_cols_present, drop = FALSE]
+      safe_rbind(train_sel, test_sel)
+    }
+
+    # 10) CROSS-VALIDATION on training set to get CV predictions (for residuals)
+    ntrain <- nrow(train_df_reg)
+    folds <- sample(rep(1:cv_folds, length.out = ntrain))
+    cv_pred_train_log <- rep(NA_real_, ntrain)
+
+    # columns to include in imputation: final_predictors + LF_log (LF_log exists in train)
+    impute_cols <- c(final_predictors, "LF_log")
+
+    for (k in seq_len(cv_folds)) {
+      tr_idx_k <- which(folds != k)
+      val_idx_k <- which(folds == k)
+      if (length(tr_idx_k) < 5 || length(val_idx_k) < 1) next
+
+      fold_train <- train_df_reg[tr_idx_k, , drop = FALSE]
+      fold_val   <- train_df_reg[val_idx_k, , drop = FALSE]
+
+      combined_fold <- build_combined_for_impute(fold_train[, impute_cols, drop = FALSE],
+                                                fold_val[, impute_cols, drop = FALSE],
+                                                impute_cols)
+      # impute LF_log on combined_fold using missForest
+      mf_out <- tryCatch(missForest::missForest(combined_fold, maxiter = 5, ntree = mf_ntree, verbose = FALSE),
+                         error = function(e) NULL)
+      if (is.null(mf_out)) next
+
+      imputed_fold <- mf_out$ximp
+      ntr <- nrow(fold_train)
+      pred_val_log <- imputed_fold$LF_log[(ntr + 1):nrow(imputed_fold)]
+      cv_pred_train_log[val_idx_k] <- pred_val_log
+    }
+
+    # if some cv preds missing, fill them by fitting on full train once
+    missing_cv <- which(is.na(cv_pred_train_log))
+    if (length(missing_cv) > 0) {
+      combined_full <- build_combined_for_impute(train_df_reg[, impute_cols, drop = FALSE],
+                                                test_df_reg[, impute_cols, drop = FALSE],
+                                                impute_cols)
+      mf_out_full <- tryCatch(missForest::missForest(combined_full, maxiter = 5, ntree = mf_ntree, verbose = FALSE),
+                              error = function(e) NULL)
+      if (!is.null(mf_out_full)) {
+        imputed_full <- mf_out_full$ximp
+        cv_train_full <- imputed_full$LF_log[1:nrow(train_df_reg)]
+        cv_pred_train_log[missing_cv] <- cv_train_full[missing_cv]
+      }
+    }
+
+    # 11) compute residuals on original scale and determine hard training rows
+    pred_train_orig <- expm1(cv_pred_train_log)
+    true_train_orig <- train_df_reg[[target_var]]
+    resid_train <- abs(true_train_orig - pred_train_orig)
+    resid_mean <- mean(resid_train, na.rm = TRUE)
+    resid_sd   <- sd(resid_train, na.rm = TRUE)
+    hard_threshold <- resid_mean + hard_resid_sd_mult * resid_sd
+    hard_train_idx <- which(resid_train > hard_threshold)
+
+    # relax threshold until we have at least specialist_min_rows (conservative)
+    if (length(hard_train_idx) < specialist_min_rows) {
+      mult_try <- hard_resid_sd_mult
+      while (length(hard_train_idx) < specialist_min_rows && mult_try >= 0.5) {
+        mult_try <- mult_try - 0.25
+        hard_threshold2 <- resid_mean + mult_try * resid_sd
+        hard_train_idx <- which(resid_train > hard_threshold2)
+        if (mult_try <= 0.5) break
+      }
+    }
+
+    # 12) MAIN imputation using missForest (train+test combined)
+    combined_main <- build_combined_for_impute(train_df_reg[, impute_cols, drop = FALSE],
+                                              test_df_reg[, impute_cols, drop = FALSE],
+                                              impute_cols)
+    mf_out_main <- tryCatch(missForest::missForest(combined_main, maxiter = 10, ntree = mf_ntree, verbose = FALSE),
+                            error = function(e) NULL)
+    main_pred_log <- rep(NA_real_, nrow(test_df_reg))
+    if (!is.null(mf_out_main)) {
+      imputed_main <- mf_out_main$ximp
+      ntr <- nrow(train_df_reg)
+      main_pred_log <- imputed_main$LF_log[(ntr + 1):nrow(imputed_main)]
+    }
+
+    # 13) SPECIALIST imputation (if enough hard rows)
+    specialist_pred_log <- rep(NA_real_, nrow(test_df_reg))
+    if (length(hard_train_idx) >= 5) {
+      spec_train <- train_df_reg[hard_train_idx, , drop = FALSE]
+      spec_impute_cols <- c(final_predictors, "LF_log")
+      spec_combined <- build_combined_for_impute(spec_train[, spec_impute_cols, drop = FALSE],
+                                                 test_df_reg[, spec_impute_cols, drop = FALSE],
+                                                 spec_impute_cols)
+      mf_out_spec <- tryCatch(missForest::missForest(spec_combined, maxiter = 10, ntree = max(200, mf_ntree), verbose = FALSE),
+                              error = function(e) NULL)
+      if (!is.null(mf_out_spec)) {
+        imputed_spec <- mf_out_spec$ximp
+        ntr_spec <- nrow(spec_train)
+        specialist_pred_log <- imputed_spec$LF_log[(ntr_spec + 1):nrow(imputed_spec)]
+      }
+
+      # classifier to route test rows to specialist (random forest)
+      is_hard_label <- rep(0, nrow(train_df_reg)); is_hard_label[hard_train_idx] <- 1
+      clf_df <- train_df_reg[, final_predictors, drop = FALSE]
+      clf_df$is_hard <- factor(is_hard_label)
+      # remove zero-variance columns
+      keep_cols <- names(clf_df)[sapply(clf_df, function(x) !(is.numeric(x) && var(as.numeric(x), na.rm = TRUE) == 0))]
+      clf_df <- clf_df[, keep_cols, drop = FALSE]
+      rf_clf <- tryCatch(randomForest::randomForest(is_hard ~ ., data = clf_df, ntree = 200), error = function(e) NULL)
+      use_specialist <- integer(0)
+      if (!is.null(rf_clf)) {
+        test_clf_df <- test_df_reg[, names(clf_df)[names(clf_df) != "is_hard"], drop = FALSE]
+        # align factor levels with training clf_df
+        for (f in names(test_clf_df)) if (is.factor(clf_df[[f]])) test_clf_df[[f]] <- factor(test_clf_df[[f]], levels = levels(clf_df[[f]]))
+        probs <- tryCatch(predict(rf_clf, newdata = test_clf_df, type = "prob")[, "1"], error = function(e) rep(0, nrow(test_clf_df)))
+        use_specialist <- which(probs > specialist_prob_threshold & !is.na(specialist_pred_log))
+      }
+    }
+
+    # 14) Combine main & specialist predictions, back-transform
+    final_pred_log <- main_pred_log
+    if (length(use_specialist) > 0) final_pred_log[use_specialist] <- specialist_pred_log[use_specialist]
+    final_pred_orig_mf <- expm1(final_pred_log)
+
+    # 15) XGBoost model (single-stage) - train on train_df_reg, predict test_df_reg
+    # Prepare model.matrix (one-hot encoding) for numeric + factor predictors
+    # Build formula to include only final_predictors
+    xgb_train_mat <- tryCatch({
+      model.matrix(~ . - 1, data = train_df_reg[, final_predictors, drop = FALSE])
+    }, error = function(e) NULL)
+    xgb_test_mat <- NULL
+    xgb_pred_orig <- rep(NA_real_, nrow(test_df_reg))
+    if (!is.null(xgb_train_mat)) {
+      # ensure same columns/order for test
+      xgb_test_mat <- tryCatch({
+        model.matrix(~ . - 1, data = test_df_reg[, final_predictors, drop = FALSE])
+      }, error = function(e) NULL)
+      if (!is.null(xgb_test_mat)) {
+        # align columns
+        allcols <- union(colnames(xgb_train_mat), colnames(xgb_test_mat))
+        add_missing_mat <- function(mat, cols) {
+          for (cname in cols) if (!(cname %in% colnames(mat))) mat <- cbind(mat, setNames(rep(0, nrow(mat)), cname))
+          mat[, cols, drop = FALSE]
+        }
+        xgb_train_mat2 <- add_missing_mat(xgb_train_mat, allcols)
+        xgb_test_mat2  <- add_missing_mat(xgb_test_mat, allcols)
+        # order columns
+        xgb_train_mat2 <- xgb_train_mat2[, allcols, drop = FALSE]
+        xgb_test_mat2  <- xgb_test_mat2[, allcols, drop = FALSE]
+        # target is LF_log
+        y_train_log <- train_df_reg$LF_log
+        dtrain <- xgboost::xgb.DMatrix(data = xgb_train_mat2, label = y_train_log)
+        params <- list(objective = "reg:squarederror", eval_metric = "rmse")
+        xgb_mod <- tryCatch(xgboost::xgb.train(params = params, data = dtrain, nrounds = xgb_nrounds, verbose = 0), error = function(e) NULL)
+        if (!is.null(xgb_mod)) {
+          dtest <- xgboost::xgb.DMatrix(data = xgb_test_mat2)
+          pred_xgb_log <- tryCatch(as.numeric(predict(xgb_mod, dtest)), error = function(e) rep(NA_real_, nrow(test_df_reg)))
+          xgb_pred_orig <- expm1(pred_xgb_log)
+        }
+      }
+    }
+
+    # 16) Compose predictions tibble and compute metrics
+    all_predictions <- tibble::tibble(
+      index = test_idx,
+      true = true_values_orig,
+      pred_missForest_two_stage = final_pred_orig_mf,
+      pred_xgboost = xgb_pred_orig
+    )
+
+    res_mf <- eval_metrics(true_values_orig, all_predictions$pred_missForest_two_stage)
+    res_xgb <- eval_metrics(true_values_orig, all_predictions$pred_xgboost)
+
+    metrics_table <- tibble::tibble(
+      alpha_cor = alpha_cor,
+      alpha_anova = alpha_anova,
+      mf_ntree = mf_ntree,
+      xgb_nrounds = xgb_nrounds,
+      Method = c("missForest_two_stage", "xgboost"),
+      RMSE = c(res_mf$RMSE, res_xgb$RMSE),
+      MAE  = c(res_mf$MAE, res_xgb$MAE),
+      R2   = c(res_mf$R2, res_xgb$R2),
+      n_predictors = length(final_predictors)
+    )
+
+    # return requested outputs: best prediction per method? we return per-method predictions + metrics
+    return(list(
+      metrics_table = metrics_table,
+      all_predictions = all_predictions
+    ))
+
+  }, error = function(e) {
+    warning("evaluate_combo failed: ", conditionMessage(e))
+    tib <- tibble::tibble(
+      alpha_cor = if (exists("alpha_cor")) alpha_cor else NA_real_,
+      alpha_anova = if (exists("alpha_anova")) alpha_anova else NA_real_,
+      mf_ntree = if (exists("mf_ntree")) mf_ntree else NA_integer_,
+      xgb_nrounds = if (exists("xgb_nrounds")) xgb_nrounds else NA_integer_,
+      Method = c("missForest_two_stage", "xgboost"),
+      RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_, n_predictors = NA_integer_
+    )
+    return(list(metrics_table = tib, all_predictions = NULL))
+  })
+}
+
+results_list <- purrr::map(param_list, evaluate_combo, df = train_csv)
+# collect metrics:
+metrics_all <- purrr::map_dfr(results_list, ~ .x$metrics_table)
+# collect predictions (list per combo):
+preds_all <- purrr::map(results_list, ~ .x$all_predictions)
+
+best_by_combo <- metrics_all %>%
+  group_by(alpha_cor, alpha_anova, mf_ntree, xgb_nrounds, Method) %>%
+  summarise(RMSE = mean(RMSE, na.rm = TRUE), .groups = "drop") %>%
+  arrange(RMSE) %>%
+  slice_head(n = 20)
+
+print(best_by_combo)
+```
+This updated method produces a very similar result, (R2 = 0.69, RMSe = 11.4), although not a better one. Also xgboost works really well, almost as well as missForest on this dataset. 
+
+We'll next try to see if the model can be fit on the errors present in the inaccurate predictions. If the errors are representative of some underlying pattern, this can improve the predictions by fitting for these specific patterns. However, this method is prone to some level of overfitting, so we'll check using cross-validation to ensure that any improvement we see in prediction accuracy is due to the updated model fitting patterns in the errors and not noise within the error terms.
+```{r}
+refine_imputation_cv_rf <- function(df_all,
+                                    best_prediction,
+                                    predictors,
+                                    target_var = "LotFrontage",
+                                    k = 10,
+                                    ntree = 100,
+                                    nodesize = 5,
+                                    numeric_top_n = 5,
+                                    seed = 123,
+                                    verbose = TRUE) {
+  # Dependencies
+  suppressPackageStartupMessages({
+    library(dplyr)
+    library(randomForest)
+    library(ggplot2)
+  })
+  set.seed(seed)
+
+  # --- Sanity checks -------------------------------------------------------
+  required_cols <- c("pred", "true", "index")
+  if (!all(required_cols %in% names(best_prediction))) {
+    stop("best_prediction must contain columns: 'pred', 'true', 'index'.")
+  }
+  if (!all(best_prediction$index %in% seq_len(nrow(df_all)))) {
+    stop("Some indices in best_prediction$index are not valid row indices in df_all.")
+  }
+
+  # Observed indices and vectors (aligned to best_prediction order)
+  obs_idx <- best_prediction$index
+  preds_obs <- best_prediction$pred
+  true_obs  <- best_prediction$true
+  n_obs <- length(obs_idx)
+  if (n_obs < k) stop("Number of folds k must be <= number of observed rows.")
+
+  # Prepare full-length vectors (aligned to df_all) for diagnostic function
+  n_all <- nrow(df_all)
+  preds_full <- rep(NA_real_, n_all)
+  true_full  <- rep(NA_real_, n_all)
+  preds_full[obs_idx] <- preds_obs
+  true_full[obs_idx]  <- true_obs
+
+  # Run your diagnostic function (expects full-length vectors)
+  diagnostic <- analyse_bad_predictions(
+    df_all = df_all,
+    predictions = preds_full,
+    true_values = true_full,
+    predictors = predictors,
+    n_sd = 0.5,
+    p_thresh = 0.1
+  )
+
+  # --- Choose problem variables (from diagnostic) -------------------------
+  problem_vars <- character(0)
+
+  if (!is.null(diagnostic$numeric_summary) && nrow(diagnostic$numeric_summary) > 0) {
+    ordered_nums <- diagnostic$numeric_summary %>%
+      arrange(desc(abs(Mean_Diff))) %>%
+      pull(Variable)
+    problem_vars <- c(problem_vars, head(ordered_nums, numeric_top_n))
+  }
+  if (!is.null(diagnostic$factor_summary) && length(diagnostic$factor_summary) > 0) {
+    problem_vars <- c(problem_vars, names(diagnostic$factor_summary))
+  }
+  problem_vars <- unique(problem_vars)
+  # Fallback to the full predictors if diagnostic gave nothing usable
+  if (length(problem_vars) == 0) {
+    if (verbose) message("Diagnostic did not flag variables — using all predictors.")
+    problem_vars <- predictors
+  } else {
+    # ensure problem_vars exist in predictors
+    problem_vars <- intersect(problem_vars, predictors)
+    if (length(problem_vars) == 0) {
+      if (verbose) message("Problem vars were not found in provided predictors — using all predictors.")
+      problem_vars <- predictors
+    }
+  }
+
+  # --- Build modeling dataframe for observed rows --------------------------
+  df_obs <- df_all[obs_idx, problem_vars, drop = FALSE] %>% as.data.frame()
+  df_obs$.residual <- preds_obs - true_obs  # r = pred - true
+
+  # --- k-fold cross-validation (OOF predictions for the residuals) -------
+  folds <- sample(rep(seq_len(k), length.out = n_obs))
+  oof_pred_residual <- rep(NA_real_, n_obs)   # predicted residuals out-of-fold
+  oof_pred_corrected <- rep(NA_real_, n_obs)  # corrected predictions out-of-fold
+
+  for (fold in seq_len(k)) {
+    train_idx <- which(folds != fold)
+    val_idx   <- which(folds == fold)
+
+    train_x <- df_obs[train_idx, problem_vars, drop = FALSE]
+    train_y <- df_obs$.residual[train_idx]
+
+    val_x <- df_obs[val_idx, problem_vars, drop = FALSE]
+
+    # Train a restrained random forest on residuals
+    rf_model <- randomForest(x = train_x, y = train_y, ntree = ntree, nodesize = nodesize)
+
+    # Predict residuals on validation fold
+    pred_res_val <- predict(rf_model, val_x)
+
+    # store OOF predictions
+    oof_pred_residual[val_idx] <- pred_res_val
+    # corrected predictions on validation fold (in best_prediction order)
+    oof_pred_corrected[val_idx] <- preds_obs[val_idx] - pred_res_val
+  }
+
+  # --- CV metrics (on observed rows, using OOF predictions) ----------------
+  rmse_before <- sqrt(mean((preds_obs - true_obs)^2, na.rm = TRUE))
+  rmse_after_oof <- sqrt(mean((oof_pred_corrected - true_obs)^2, na.rm = TRUE))
+  improvement_oof <- rmse_before - rmse_after_oof
+
+  if (verbose) {
+    cat(sprintf("OOF CV: RMSE before = %.4f; after (OOF corrected) = %.4f; Δ = %.4f\n",
+                rmse_before, rmse_after_oof, improvement_oof))
+  }
+
+  # --- Train final meta-model on all observed rows -------------------------
+  final_rf <- randomForest(x = df_obs[, problem_vars, drop = FALSE],
+                           y = df_obs$.residual,
+                           ntree = ntree,
+                           nodesize = nodesize)
+
+  # Predict correction for all rows in df_all (will return NA for rows where model.matrix fails,
+  # but randomForest supports factors so it's fine if df_all has same factor levels).
+  df_all_sub <- df_all[, problem_vars, drop = FALSE] %>% as.data.frame()
+  final_correction_full <- tryCatch({
+    predict(final_rf, newdata = df_all_sub)
+  }, error = function(e) {
+    # if predict fails (rare), produce NA vector
+    warning("Predicting final correction on full data failed: ", e$message)
+    rep(NA_real_, n_all)
+  })
+
+  # Build corrected predictions
+  corrected_full <- preds_full - final_correction_full   # only where preds_full not NA will be meaningful
+  corrected_obs <- corrected_full[obs_idx]              # same order as best_prediction
+
+  # --- More summary metrics -----------------------------------------------
+  rmse_after_final <- sqrt(mean((corrected_obs - true_obs)^2, na.rm = TRUE))
+  improvement_final <- rmse_before - rmse_after_final
+
+  if (verbose) {
+    cat(sprintf("Final model trained on all observed rows: RMSE after final correction = %.4f (Δ relative to before = %.4f)\n",
+                rmse_after_final, improvement_final))
+  }
+
+  # --- Generate diagnostic plots ------------------------------------------
+  # 1) Residual histograms before / after (OOF)
+  plot_resid_df <- data.frame(
+    type = rep(c("before", "after_oof"), each = n_obs),
+    resid = c((preds_obs - true_obs), (oof_pred_residual - 0)) # note: before residual = pred - true; after_oof residual ~ corrected - true = (pred - pred_resid) - true = (pred - true) - pred_resid
+  )
+  # But easier: compare distribution of (pred - true) and (corrected - true)
+  plot_resid_df2 <- data.frame(
+    type = rep(c("before", "after_oof"), each = n_obs),
+    value = c((preds_obs - true_obs), (oof_pred_corrected - true_obs))
+  )
+
+  p1 <- ggplot(plot_resid_df2, aes(x = value, fill = type)) +
+    geom_density(alpha = 0.35) + labs(title = "Residual distribution: before vs OOF-corrected",
+                                      x = "Residual (pred - true)", y = "Density") +
+    theme_minimal()
+
+  # 2) Scatter: predicted vs true (before and after OOF) — sample if many points
+  plot_df_scatter <- data.frame(
+    true = rep(true_obs, 2),
+    pred = c(preds_obs, oof_pred_corrected),
+    stage = rep(c("before", "after_oof"), each = n_obs)
+  )
+  p2 <- ggplot(plot_df_scatter, aes(x = true, y = pred, color = stage)) +
+    geom_point(alpha = 0.7) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+    labs(title = "Predicted vs True: before vs OOF-corrected", x = "True", y = "Predicted") +
+    theme_minimal()
+
+  # 3) Improvement by top factor (if any factor vars exist among problem_vars)
+  factor_vars_in_problem <- problem_vars[sapply(df_all[, problem_vars, drop = FALSE], is.factor) |
+                                          sapply(df_all[, problem_vars, drop = FALSE], is.character)]
+  p3 <- NULL
+  if (length(factor_vars_in_problem) > 0) {
+    top_factor <- factor_vars_in_problem[1]
+    df_factor <- data.frame(
+      level = as.character(df_all[obs_idx, top_factor]),
+      before_err = preds_obs - true_obs,
+      after_err_oof = oof_pred_corrected - true_obs
+    )
+    agg_df <- df_factor %>%
+      group_by(level) %>%
+      summarise(mean_before = mean(before_err, na.rm = TRUE),
+                mean_after  = mean(after_err_oof, na.rm = TRUE),
+                n = n()) %>%
+      arrange(desc(abs(mean_before))) %>%
+      filter(n >= 3)  # at least 3 observations per level for stable display
+
+    if (nrow(agg_df) > 0) {
+      agg_df_long <- tidyr::pivot_longer(agg_df, cols = c("mean_before", "mean_after"),
+                                         names_to = "stage", values_to = "mean_err")
+      p3 <- ggplot(agg_df_long, aes(x = reorder(level, -abs(mean_err)), y = mean_err, fill = stage)) +
+        geom_col(position = position_dodge(width = 0.8)) +
+        labs(title = paste0("Mean residual by level of ", top_factor),
+             x = paste0(top_factor, " (levels)"), y = "Mean residual (pred - true)") +
+        theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    }
+  }
+
+  # --- Return a structured list -------------------------------------------
+  out <- list(
+    diagnostic = diagnostic,         # from analyse_bad_predictions (full-df aligned)
+    problem_vars = problem_vars,     # predictors used by meta-model
+    final_model = final_rf,          # final randomForest meta-model (trained on all observed rows)
+    oof = list(
+      residual_pred_oof = oof_pred_residual,   # predicted residuals, OOF, length n_obs
+      corrected_pred_oof = oof_pred_corrected, # corrected predictions, OOF, length n_obs
+      rmse_before = rmse_before,
+      rmse_after_oof = rmse_after_oof,
+      improvement_oof = improvement_oof
+    ),
+    final = list(
+      corrected_full = corrected_full, # length n_all; NA where preds_full is NA
+      corrected_obs = corrected_obs,   # length n_obs; same order as best_prediction
+      rmse_after_final = rmse_after_final,
+      improvement_final = improvement_final
+    ),
+    plots = list(resid_density = p1, pred_vs_true = p2, factor_improvement = p3),
+    meta = list(k = k, ntree = ntree, nodesize = nodesize, seed = seed,
+                problem_var_count = length(problem_vars))
+  )
+
+  return(out)
+}
+
+
+res <- refine_imputation_cv_rf(
+  df_all = df_all,
+  best_prediction = best_prediction,   # must have columns 'pred', 'true', 'index'
+  predictors = names(df_all),          # or a subset of predictors
+  target_var = "LotFrontage",
+  k = 10,
+  ntree = 100,
+  nodesize = 5,
+  numeric_top_n = 5,
+  seed = 42,
+  verbose = TRUE
+)
+```
+
+```{r}
+fe_engineering <- function(df,
+                           collapse_factor_min = 5,
+                           numeric_log = NULL,
+                           numeric_sqrt = NULL,
+                           poly_vars = NULL,        # named list: list(col = degree)
+                           interactions = NULL,     # list of character vectors c("A","B")
+                           binning = NULL,          # named list: list(col = c(cuts))
+                           winsorize = NULL,        # named list: list(col = c(lower_pct, upper_pct))
+                           one_hot = FALSE,
+                           remove_original = FALSE) {
+  # Purpose: create common FE transforms in-place and return metadata
+  #
+  # Returns: list(data = data.frame, meta = list(created = <vector>, mapping info...))
+  #
+  library(dplyr); library(forcats); library(tidyr)
+  df2 <- as.data.frame(df)
+  meta <- list(created = character(0), collapsed = list())
+
+  # 1) collapse rare factor levels
+  factor_cols <- names(df2)[sapply(df2, is.factor)]
+  for (v in factor_cols) {
+    tbl <- table(df2[[v]])
+    rare <- names(tbl)[tbl < collapse_factor_min]
+    if (length(rare) > 0) {
+      df2[[v]] <- forcats::fct_collapse(df2[[v]], Other = rare)
+      df2[[v]] <- droplevels(df2[[v]])
+      meta$collapsed[[v]] <- rare
+    }
+  }
+
+  # 2) winsorize numeric columns
+  if (!is.null(winsorize)) {
+    for (v in names(winsorize)) {
+      p <- winsorize[[v]]
+      if (!is.numeric(df2[[v]])) next
+      lo <- quantile(df2[[v]], probs = p[1], na.rm = TRUE)
+      hi <- quantile(df2[[v]], probs = p[2], na.rm = TRUE)
+      newn <- paste0(v, "_winsor")
+      df2[[newn]] <- pmin(pmax(df2[[v]], lo), hi)
+      meta$created <- c(meta$created, newn)
+    }
+  }
+
+  # 3) log / sqrt transforms
+  if (!is.null(numeric_log)) {
+    for (v in numeric_log) {
+      if (!is.numeric(df2[[v]])) next
+      newn <- paste0("log_", v)
+      df2[[newn]] <- ifelse(!is.na(df2[[v]]) & df2[[v]] > 0, log(df2[[v]]), NA_real_)
+      meta$created <- c(meta$created, newn)
+    }
+  }
+  if (!is.null(numeric_sqrt)) {
+    for (v in numeric_sqrt) {
+      if (!is.numeric(df2[[v]])) next
+      newn <- paste0("sqrt_", v)
+      df2[[newn]] <- ifelse(!is.na(df2[[v]]), sqrt(pmax(df2[[v]], 0)), NA_real_)
+      meta$created <- c(meta$created, newn)
+    }
+  }
+
+  # 4) polynomial features
+  if (!is.null(poly_vars)) {
+    for (v in names(poly_vars)) {
+      deg <- as.integer(poly_vars[[v]])
+      if (!is.numeric(df2[[v]])) next
+      for (d in 2:deg) {
+        newn <- paste0(v, "_poly", d)
+        df2[[newn]] <- ifelse(!is.na(df2[[v]]), df2[[v]]^d, NA_real_)
+        meta$created <- c(meta$created, newn)
+      }
+    }
+  }
+
+  # 5) interactions (simple multiplicative interactions)
+  if (!is.null(interactions)) {
+    for (pair in interactions) {
+      v1 <- pair[1]; v2 <- pair[2]
+      if (! (v1 %in% names(df2) && v2 %in% names(df2))) next
+      newn <- paste0(v1, "_x_", v2)
+      df2[[newn]] <- ifelse(!is.na(df2[[v1]]) & !is.na(df2[[v2]]), df2[[v1]] * df2[[v2]], NA_real_)
+      meta$created <- c(meta$created, newn)
+    }
+  }
+
+  # 6) binning
+  if (!is.null(binning)) {
+    for (v in names(binning)) {
+      if (!is.numeric(df2[[v]])) next
+      cuts <- binning[[v]]
+      newn <- paste0(v, "_binned")
+      df2[[newn]] <- cut(df2[[v]], breaks = c(-Inf, cuts, Inf), include.lowest = TRUE)
+      df2[[newn]] <- droplevels(df2[[newn]])
+      meta$created <- c(meta$created, newn)
+    }
+  }
+
+  # 7) optional one-hot encoding
+  df_out <- df2
+  if (one_hot) {
+    mm <- model.matrix(~ . - 1, data = df2)
+    df_out <- as.data.frame(mm)
+  }
+
+  # 8) remove originals if requested
+  if (remove_original) {
+    to_remove <- c(names(poly_vars), numeric_log, numeric_sqrt, names(binning), unlist(interactions))
+    to_remove <- intersect(to_remove, names(df_out))
+    df_out <- df_out[, setdiff(names(df_out), to_remove), drop = FALSE]
+  }
+
+  return(list(data = df_out, meta = meta))
+}
+
+
+```
+
+```{r}
+run_imputer_cv <- function(df,
+                           target_var = "LotFrontage",
+                           predictors = NULL,
+                           methods = c("lm", "xgb", "lgb", "ranger"),
+                           param_grids = NULL,         # list of param grids per method (see defaults below)
+                           n_folds = 5,
+                           n_repeats = 3,
+                           mask_frac = 0.20,           # constant 20% masked per fold as requested
+                           min_rows_train = 30,
+                           seed = 123,
+                           parallel = TRUE,
+                           workers = NULL,
+                           verbose = TRUE) {
+  library(dplyr); library(purrr); library(tidyr)
+  library(furrr); library(future)
+  library(ranger); library(randomForest)
+  library(xgboost); library(lightgbm)
+  library(mgcv); # for GAM if you ever add gam to methods
+  set.seed(seed)
+
+  if (is.null(predictors)) predictors <- setdiff(names(df), target_var)
+  if (!target_var %in% names(df)) stop("target_var not in df")
+
+  # prepare default param grids if none supplied
+  default_grids <- list(
+    lm = expand.grid(dummy = NA),  # lm has no hyperparams
+    xgb = expand.grid(eta = c(0.05, 0.1),
+                      max_depth = c(3L, 5L),
+                      nrounds = c(50L, 100L)),
+    lgb = expand.grid(learning_rate = c(0.05, 0.1),
+                      num_leaves = c(15L, 31L),
+                      nrounds = c(50L, 100L)),
+    ranger = expand.grid(num.trees = c(100L),
+                         min.node.size = c(5L, 10L))
+  )
+  if (is.null(param_grids)) param_grids <- default_grids
+  # ensure each requested method has a param grid
+  for (m in methods) {
+    if (!m %in% names(param_grids)) {
+      if (m %in% names(default_grids)) param_grids[[m]] <- default_grids[[m]] else stop("No param grid for method ", m)
+    }
+  }
+
+  # setup parallel plan
+  if (parallel) {
+    if (is.null(workers)) {
+      workers <- max(1L, future::availableCores() - 1L)
+    }
+    plan(multisession, workers = workers)
+    if (verbose) message("Parallel plan multisession with ", workers, " workers")
+    use_future_map <- TRUE
+  } else {
+    plan(sequential)
+    use_future_map <- FALSE
+  }
+
+  # helper: mask selection that preserves factor levels in train
+  make_mask_indices <- function(known_idx, mask_frac, df_local, predictors_local, min_rows_train, max_attempts = 200) {
+    mask_n <- max(1, round(length(known_idx) * mask_frac))
+    attempt <- 1
+    while (attempt <= max_attempts) {
+      mask_try <- sample(known_idx, mask_n)
+      train_idx <- setdiff(known_idx, mask_try)
+      if (length(train_idx) < min_rows_train) { attempt <- attempt + 1; next }
+      # ensure factors have >1 level in training
+      ok <- TRUE
+      for (f in predictors_local[sapply(df_local[, predictors_local, drop = FALSE], is.factor)]) {
+        if (nlevels(droplevels(df_local[[f]][train_idx])) < 2) { ok <- FALSE; break }
+      }
+      if (ok) return(list(mask = mask_try, train = train_idx))
+      attempt <- attempt + 1
+    }
+    return(NULL)
+  }
+
+  # get indices where target is observed
+  obs_all_idx <- which(!is.na(df[[target_var]]))
+  if (length(obs_all_idx) < (min_rows_train + 2)) stop("Not enough observed target rows to perform CV")
+
+  # For results storage
+  all_method_results <- list()
+
+  # Iterate methods
+  for (method in methods) {
+    if (verbose) message("Evaluating method: ", method)
+    grid <- param_grids[[method]]
+    # make grid list of rows
+    grid_list <- split(grid, seq_len(nrow(grid)))
+
+    # evaluate each param combo with repeated masking CV
+    eval_param_combo <- function(param_row) {
+      params <- as.list(param_row)
+      if (verbose) message("  combo: ", paste(names(params), params, collapse = ", "))
+      # storage for OOF predictions and truths
+      oof_preds <- rep(NA_real_, length(obs_all_idx))
+      names(oof_preds) <- obs_all_idx
+      truths <- df[[target_var]][obs_all_idx]
+      # repeated masking
+      for (rep_i in seq_len(n_repeats)) {
+        for (fold_i in seq_len(n_folds)) {
+          mask_out <- make_mask_indices(obs_all_idx, mask_frac = mask_frac, df_local = df, predictors_local = predictors, min_rows_train = min_rows_train)
+          if (is.null(mask_out)) next
+          mask_idx <- mask_out$mask
+          train_idx <- mask_out$train
+
+          # Build training dataframe (complete-case for chosen predictors)
+          keep_idx <- c(train_idx, mask_idx)
+          model_df <- df[keep_idx, c(target_var, predictors), drop = FALSE]
+          # set masked values to NA
+          model_df[[target_var]][match(mask_idx, keep_idx)] <- NA
+
+          train_rows <- which(!is.na(model_df[[target_var]]))
+          test_rows_rel <- which(is.na(model_df[[target_var]])) # relative to model_df
+          if (length(train_rows) < min_rows_train) next
+
+          # align factor levels for predictors within model_df
+          for (p in predictors) {
+            if (is.factor(model_df[[p]])) {
+              levs <- levels(droplevels(model_df[[p]][train_rows]))
+              model_df[[p]] <- factor(model_df[[p]], levels = levs)
+            }
+          }
+
+          # prepare data for each method
+          if (method == "lm") {
+            form <- as.formula(paste(target_var, "~", paste(predictors, collapse = " + ")))
+            fit <- tryCatch(lm(form, data = model_df[train_rows, , drop = FALSE]), error = function(e) NULL)
+            if (!is.null(fit)) {
+              preds_rel <- tryCatch(predict(fit, newdata = model_df[test_rows_rel, , drop = FALSE]), error = function(e) rep(NA_real_, length(test_rows_rel)))
+            } else preds_rel <- rep(NA_real_, length(test_rows_rel))
+          } else if (method == "xgb") {
+            mm_train <- model.matrix(~ . - 1, data = model_df[train_rows, predictors, drop = FALSE])
+            mm_test  <- model.matrix(~ . - 1, data = model_df[test_rows_rel, predictors, drop = FALSE])
+            dtrain <- xgboost::xgb.DMatrix(data = mm_train, label = model_df[[target_var]][train_rows])
+            xgb_params <- list(objective = "reg:squarederror", eta = params$eta, max_depth = as.integer(params$max_depth))
+            xgb_mod <- tryCatch(xgboost::xgb.train(params = xgb_params, data = dtrain, nrounds = as.integer(params$nrounds), verbose = 0), error = function(e) NULL)
+            if (!is.null(xgb_mod)) {
+              preds_rel <- tryCatch(predict(xgb_mod, mm_test), error = function(e) rep(NA_real_, nrow(mm_test)))
+            } else preds_rel <- rep(NA_real_, nrow(mm_test))
+          } else if (method == "lgb") {
+            mm_train <- model.matrix(~ . - 1, data = model_df[train_rows, predictors, drop = FALSE])
+            mm_test  <- model.matrix(~ . - 1, data = model_df[test_rows_rel, predictors, drop = FALSE])
+            dtrain <- lightgbm::lgb.Dataset(data = mm_train, label = model_df[[target_var]][train_rows])
+            lgb_params <- list(objective = "regression", learning_rate = params$learning_rate, num_leaves = as.integer(params$num_leaves))
+            lgb_mod <- tryCatch(lightgbm::lgb.train(params = lgb_params, data = dtrain, nrounds = as.integer(params$nrounds), verbose = -1), error = function(e) NULL)
+            if (!is.null(lgb_mod)) {
+              preds_rel <- tryCatch(predict(lgb_mod, mm_test), error = function(e) rep(NA_real_, nrow(mm_test)))
+            } else preds_rel <- rep(NA_real_, nrow(mm_test))
+          } else if (method == "ranger") {
+            # ranger supports factor predictors natively
+            fit <- tryCatch(ranger::ranger(as.formula(paste(target_var, "~", paste(predictors, collapse = " + "))),
+                                          data = model_df[train_rows, , drop = FALSE],
+                                          num.trees = as.integer(params$num.trees),
+                                          min.node.size = as.integer(params$min.node.size),
+                                          verbose = FALSE), error = function(e) NULL)
+            if (!is.null(fit)) {
+              preds_rel <- tryCatch(predict(fit, data = model_df[test_rows_rel, , drop = FALSE])$predictions, error = function(e) rep(NA_real_, length(test_rows_rel)))
+            } else preds_rel <- rep(NA_real_, length(test_rows_rel))
+          } else {
+            preds_rel <- rep(NA_real_, length(test_rows_rel))
+          }
+
+          # put preds_rel into oof_preds at the absolute indices
+          abs_test_idx <- keep_idx[test_rows_rel]
+          for (j in seq_along(abs_test_idx)) {
+            abs_idx <- abs_test_idx[j]
+            oof_preds[as.character(abs_idx)] <- preds_rel[j]
+          }
+
+        } # end folds
+      } # end repeats
+
+      # compute metrics on oof_preds vs truths (only where both present)
+      idx_ok <- which(!is.na(oof_preds))
+      if (length(idx_ok) == 0) {
+        rmse <- NA_real_; mae <- NA_real_; r2 <- NA_real_ ; n_ok <- 0
+      } else {
+        tvals <- truths[idx_ok]; pvals <- unname(oof_preds[idx_ok])
+        rmse <- sqrt(mean((tvals - pvals)^2))
+        mae <- mean(abs(tvals - pvals))
+        r2 <- if (length(tvals) > 1) cor(tvals, pvals)^2 else NA_real_
+        n_ok <- length(idx_ok)
+      }
+
+      list(params = params, rmse = rmse, mae = mae, r2 = r2, n = n_ok, oof_preds = oof_preds)
+    } # end eval_param_combo
+
+    # Parallel or serial mapping through grid_list
+    if (use_future_map) {
+      combos_res <- furrr::future_map(grid_list, eval_param_combo, .progress = verbose)
+    } else {
+      combos_res <- purrr::map(grid_list, eval_param_combo)
+    }
+
+    # pick best combo by rmse (lowest)
+    rmses <- sapply(combos_res, function(x) x$rmse)
+    best_idx <- which.min(rmses)
+    best_combo_res <- combos_res[[best_idx]]
+
+    # Fit final model on all observed rows using best params (to produce final imputations)
+    observed_idx <- which(!is.na(df[[target_var]]))
+    full_train_df <- df[observed_idx, c(target_var, predictors), drop = FALSE]
+    for (p in predictors) {
+      if (is.factor(full_train_df[[p]])) full_train_df[[p]] <- droplevels(full_train_df[[p]])
+    }
+
+    if (method == "lm") {
+      final_fit <- tryCatch(lm(as.formula(paste(target_var, "~", paste(predictors, collapse = " + "))), data = full_train_df), error = function(e) NULL)
+      final_preds_full <- rep(NA_real_, nrow(df))
+      if (!is.null(final_fit)) {
+        rows_to_pred <- which(is.na(df[[target_var]])) # the originally-missing rows
+        if (length(rows_to_pred) > 0) {
+          newdata <- df[rows_to_pred, predictors, drop = FALSE]
+          # align factor levels
+          for (p in predictors) if (is.factor(full_train_df[[p]])) newdata[[p]] <- factor(newdata[[p]], levels = levels(full_train_df[[p]]))
+          final_preds_full[rows_to_pred] <- tryCatch(predict(final_fit, newdata = newdata), error = function(e) rep(NA_real_, length(rows_to_pred)))
+        }
+      }
+    } else if (method == "xgb") {
+      mm_train <- model.matrix(~ . - 1, data = full_train_df[, predictors, drop = FALSE])
+      dtrain <- xgboost::xgb.DMatrix(data = mm_train, label = full_train_df[[target_var]])
+      bp <- best_combo_res$params
+      xgb_params <- list(objective = "reg:squarederror", eta = bp$eta, max_depth = as.integer(bp$max_depth))
+      final_fit <- tryCatch(xgboost::xgb.train(params = xgb_params, data = dtrain, nrounds = as.integer(bp$nrounds), verbose = 0), error = function(e) NULL)
+      final_preds_full <- rep(NA_real_, nrow(df))
+      if (!is.null(final_fit)) {
+        rows_to_pred <- which(is.na(df[[target_var]]))
+        if (length(rows_to_pred) > 0) {
+          mm_new <- model.matrix(~ . - 1, data = df[rows_to_pred, predictors, drop = FALSE])
+          final_preds_full[rows_to_pred] <- tryCatch(predict(final_fit, mm_new), error = function(e) rep(NA_real_, length(rows_to_pred)))
+        }
+      }
+    } else if (method == "lgb") {
+      mm_train <- model.matrix(~ . - 1, data = full_train_df[, predictors, drop = FALSE])
+      dtrain <- lightgbm::lgb.Dataset(data = mm_train, label = full_train_df[[target_var]])
+      bp <- best_combo_res$params
+      lgb_params <- list(objective = "regression", learning_rate = bp$learning_rate, num_leaves = as.integer(bp$num_leaves))
+      final_fit <- tryCatch(lightgbm::lgb.train(params = lgb_params, data = dtrain, nrounds = as.integer(bp$nrounds), verbose = -1), error = function(e) NULL)
+      final_preds_full <- rep(NA_real_, nrow(df))
+      if (!is.null(final_fit)) {
+        rows_to_pred <- which(is.na(df[[target_var]]))
+        if (length(rows_to_pred) > 0) {
+          mm_new <- model.matrix(~ . - 1, data = df[rows_to_pred, predictors, drop = FALSE])
+          final_preds_full[rows_to_pred] <- tryCatch(predict(final_fit, mm_new), error = function(e) rep(NA_real_, length(rows_to_pred)))
+        }
+      }
+    } else if (method == "ranger") {
+      bp <- best_combo_res$params
+      final_fit <- tryCatch(ranger::ranger(as.formula(paste(target_var, "~", paste(predictors, collapse = " + "))),
+                                          data = full_train_df,
+                                          num.trees = as.integer(bp$num.trees),
+                                          min.node.size = as.integer(bp$min.node.size),
+                                          importance = "impurity"), error = function(e) NULL)
+      final_preds_full <- rep(NA_real_, nrow(df))
+      if (!is.null(final_fit)) {
+        rows_to_pred <- which(is.na(df[[target_var]]))
+        if (length(rows_to_pred) > 0) {
+          final_preds_full[rows_to_pred] <- tryCatch(predict(final_fit, data = df[rows_to_pred, predictors, drop = FALSE])$predictions, error = function(e) rep(NA_real_, length(rows_to_pred)))
+        }
+      }
+    } else {
+      final_fit <- NULL
+      final_preds_full <- rep(NA_real_, nrow(df))
+    }
+
+    all_method_results[[method]] <- list(
+      method = method,
+      grid = grid,
+      combos_res = combos_res,
+      best_combo = best_combo_res,
+      final_model = final_fit,
+      final_imputations = final_preds_full
+    )
+
+  } # end methods loop
+
+  # stop parallel plan
+  plan(sequential)
 
   return(list(
-    RMSE = RMSE,
-    MAE = MAE,
-    R2 = R2,
-    n_predictors = length(usable_predictors),
-    n_test = length(y),
-    predictors = usable_predictors
+    results_by_method = all_method_results,
+    params = param_grids,
+    meta = list(n_folds = n_folds, n_repeats = n_repeats, mask_frac = mask_frac)
   ))
 }
 
-result <- evaluate_ranger_imputation(train_csv, target_var = "LotFrontage")
-
-result
 ```
+
+
+
+```{r}
+diagnose_residuals <- function(df_all,
+                               bad_prediction,   # tibble with columns index, true, pred, abs_error
+                               predictors,
+                               p_thresh = 0.1,
+                               rf_ntree = 200,
+                               rf_min_node_size = 5,
+                               seed = 123) {
+  library(dplyr); library(broom); library(ggplot2); library(ranger)
+  set.seed(seed)
+
+  if (!all(c("index", "true", "pred") %in% names(bad_prediction))) stop("bad_prediction must have index,true,pred")
+  bad_idx <- bad_prediction$index
+  n_bad <- length(bad_idx)
+  n_all <- nrow(df_all)
+  other_idx <- setdiff(seq_len(n_all), bad_idx)
+
+  text_lines <- c()
+  # Numeric tests
+  numeric_vars <- predictors[sapply(df_all[, predictors, drop = FALSE], is.numeric)]
+  if (length(numeric_vars) > 0) {
+    num_res <- lapply(numeric_vars, function(v) {
+      bad_vals <- df_all[[v]][bad_idx]
+      good_vals <- df_all[[v]][other_idx]
+      # choose t-test if both >= 30 else wilcox
+      use_t <- length(na.omit(bad_vals)) >= 30 && length(na.omit(good_vals)) >= 30
+      test <- if (use_t) tryCatch(t.test(bad_vals, good_vals), error = function(e) NULL) else tryCatch(wilcox.test(bad_vals, good_vals), error = function(e) NULL)
+      tibble::tibble(Variable = v,
+                     mean_bad = mean(bad_vals, na.rm = TRUE),
+                     mean_rest = mean(good_vals, na.rm = TRUE),
+                     diff = mean_bad - mean_rest,
+                     p_value = if (!is.null(test)) broom::tidy(test)$p.value else NA_real_)
+    })
+    num_tbl <- dplyr::bind_rows(num_res)
+    top_num <- num_tbl %>% arrange(p_value) %>% head(6)
+    for (i in seq_len(nrow(top_num))) {
+      text_lines <- c(text_lines, sprintf("- Numeric %s: mean_bad=%.2f, mean_rest=%.2f, Δ=%.2f, p=%.3g",
+                                         top_num$Variable[i], top_num$mean_bad[i], top_num$mean_rest[i], top_num$diff[i], top_num$p_value[i]))
+    }
+  } else text_lines <- c(text_lines, "- No numeric predictors to test.")
+
+  # Factor tests
+  factor_vars <- predictors[sapply(df_all[, predictors, drop = FALSE], function(x) is.factor(x) || is.character(x))]
+  if (length(factor_vars) > 0) {
+    for (v in factor_vars) {
+      full_tab <- table(df_all[[v]])
+      bad_tab <- table(df_all[[v]][bad_idx])
+      all_levels <- union(names(full_tab), names(bad_tab))
+      full_tab <- full_tab[all_levels]; bad_tab <- bad_tab[all_levels]
+      full_tab[is.na(full_tab)] <- 0; bad_tab[is.na(bad_tab)] <- 0
+      p_vals <- sapply(all_levels, function(lvl) {
+        bad_yes <- bad_tab[[lvl]]; bad_no <- sum(bad_tab) - bad_yes
+        good_yes <- full_tab[[lvl]] - bad_yes; good_no <- sum(full_tab) - full_tab[[lvl]] - bad_no
+        tbl <- matrix(c(bad_yes, bad_no, good_yes, good_no), nrow = 2, byrow = TRUE)
+        if (any(tbl < 5)) {
+          test <- tryCatch(fisher.test(tbl)$p.value, error = function(e) NA_real_)
+        } else {
+          test <- tryCatch(chisq.test(tbl, correct = FALSE)$p.value, error = function(e) NA_real_)
+        }
+        test
+      })
+      over_rep <- (bad_tab / sum(bad_tab)) - (full_tab / sum(full_tab))
+      lvl_df <- tibble::tibble(level = all_levels, prop_bad = as.numeric(bad_tab / sum(bad_tab)),
+                               prop_all = as.numeric(full_tab / sum(full_tab)), over = as.numeric(over_rep), p = p_vals)
+      lvl_df <- lvl_df %>% arrange(p)
+      sig <- lvl_df %>% filter(!is.na(p) & p < p_thresh)
+      if (nrow(sig) > 0) {
+        top <- sig %>% arrange(desc(over)) %>% slice_head(n = 1)
+        text_lines <- c(text_lines, sprintf("- Factor %s: level '%s' over-represented (%.2f%% vs %.2f%%; p=%.3g)",
+                                           v, top$level, 100*top$prop_bad, 100*top$prop_all, top$p))
+      }
+    }
+  } else text_lines <- c(text_lines, "- No factor predictors to test.")
+
+  # Train RF on residuals (pred - true) restricted to bad indices (if we have residuals)
+  resid <- bad_prediction$pred - bad_prediction$true
+  rf_plot <- ggplot() + ggtitle("Not enough rows to compute importance")
+  if (length(resid) >= 10) {
+    rf_df <- df_all[bad_idx, , drop = FALSE]
+    rf_df$.resid <- resid
+    rf_mod <- ranger::ranger(.resid ~ ., data = rf_df[, c(predictors, ".resid"), drop = FALSE],
+                             num.trees = rf_ntree, min.node.size = rf_min_node_size, importance = "impurity")
+    imp <- ranger::importance(rf_mod)
+    imp_df <- tibble::tibble(variable = names(imp), importance = as.numeric(imp)) %>% arrange(desc(importance))
+    rf_plot <- ggplot(imp_df[1:min(30, nrow(imp_df)), , drop = FALSE], aes(x = reorder(variable, importance), y = importance)) +
+      geom_col() + coord_flip() + labs(title = "Feature importance for residuals (bad subset)", x = "variable", y = "importance") + theme_minimal()
+  }
+
+  text_summary <- if (length(text_lines) > 0) paste(text_lines, collapse = "\n") else "No significant structural differences detected."
+
+  list(text_summary = text_summary, numeric_table = if (exists("num_tbl")) num_tbl else NULL,
+       factor_checks = NULL, importance_plot = rf_plot)
+}
+
+
+```
+
+
+```{r}
+# small example param grids (override defaults for speed)
+param_grids_custom <- list(
+  lm = data.frame(dummy = NA),
+  xgb = expand.grid(eta = c(0.05,0.1), max_depth = c(3L), nrounds = c(50L)),
+  lgb = expand.grid(learning_rate = c(0.05), num_leaves = c(15L), nrounds = c(50L)),
+  ranger = expand.grid(num.trees = c(100L), min.node.size = c(5L))
+)
+
+res_cv <- run_imputer_cv(
+  df = train_csv,
+  target_var = "LotFrontage",
+  predictors = setdiff(names(train_csv), "LotFrontage"),
+  methods = c("lm","xgb","lgb","ranger"),
+  param_grids = param_grids_custom,
+  n_folds = 5,
+  n_repeats = 3,
+  mask_frac = 0.20,
+  min_rows_train = 30,
+  seed = 123,
+  parallel = TRUE   # uses available cores - 1
+)
+
+# Inspect results
+names(res_cv$results_by_method)
+res_cv$results_by_method$xgb$best_combo$rmse   # best combo summary RMSE
+res_cv$results_by_method$xgb$final_imputations # final imputations (length == nrow(df)); NA where not predicted
+
+
+```
+
+```{r}
+fe_res <- fe_engineering(
+  df = train_csv,
+  collapse_factor_min = 10,
+  numeric_log = c("LotArea"),
+  numeric_sqrt = c("GrLivArea"),
+  poly_vars = list(LotArea = 2),
+  interactions = list(c("LotArea", "OverallQual")),
+  binning = list(LotArea = c(5000, 10000)),
+  winsorize = list(LotArea = c(0.01, 0.99)),
+  one_hot = FALSE,
+  remove_original = FALSE
+)
+
+df_fe <- fe_res$data
+fe_meta <- fe_res$meta
+# Inspect
+str(df_fe); print(fe_meta)
+
+```
+```{r}
+diag_res <- diagnose_residuals(df_all = train_csv,
+                               bad_prediction = bad_prediction,
+                               predictors = setdiff(names(train_csv), "LotFrontage"),
+                               p_thresh = 0.1,
+                               rf_ntree = 200)
+
+cat(diag_res$text_summary)
+print(diag_res$importance_plot)
+
 ```
 
 ```{r}
