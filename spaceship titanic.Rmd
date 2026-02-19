@@ -1,0 +1,584 @@
+---
+title: "spaceship titanic"
+output: html_document
+date: "2026-02-19"
+---
+```{r}
+requiredPackages = c('here', 'tidyverse', 'dplyr', 'ggplot2', 'FNN', 'caret', 'randomForest', 'e1071', 'glmnet', 'rpart', 'class')
+for (p in requiredPackages){
+  if(!require(p,character.only = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)}
+```
+
+```{r}
+setwd('C:/Users/marnt/Desktop/kaggle/spaceship titanic')
+train_csv <-as.data.frame(read.csv('train.csv'))
+test_csv <- as.data.frame(read.csv('test.csv'))
+```
+
+Split passengerID into group and number - number is less useful, but grouping passengers can be useful
+
+```{r}
+for(i in 1:nrow(train_csv)){
+  train_csv$ID_Group[i] <- strsplit(train_csv$PassengerId[i], split='_')[[1]][1]
+  train_csv$ID_Group_num[i] <- strsplit(train_csv$PassengerId[i], split = '_')[[1]][2]}
+
+```
+
+Split cabin into deck / number / side - again, number isn't immediately useful, but deck and side could be useful
+
+```{r}
+for(i in 1:nrow(train_csv)){
+  if(train_csv$Cabin[i] != ''){
+  train_csv$Cabin_Deck[i] <- strsplit(train_csv$Cabin[i], split='/')[[1]][1]
+  train_csv$Cabin_Num[i] <- strsplit(train_csv$Cabin[i], split = '/')[[1]][2]
+  train_csv$Cabin_Side[i] <- strsplit(train_csv$Cabin[i], split='/') [[1]][3]}}
+```
+
+Transform simple character variables (transported, HomePlanet, Destination, CryoSleep, VIP, cabin) into factors. First, label missing values as missing. If we can impute some of these, we'll do that later. 
+
+```{r}
+missingCategorical = c('HomePlanet', 'CryoSleep', 'Destination', 'VIP', 'Name', 'Cabin_Deck', 'Cabin_Side')
+for (col in missingCategorical){
+  train_csv[[col]][which(train_csv[[col]] == '')] <- 'Missing'
+}
+train_csv %>% count(CryoSleep)
+```
+```{r}
+factor_cols <- c('HomePlanet', 'CryoSleep', 'Destination', 'VIP', 'Cabin_Deck', 'Cabin_Side', 'Transported')
+train_csv[,factor_cols] <- lapply(train_csv[,factor_cols], as.factor)
+```
+
+```{r}
+na_count_train <-sapply(train_csv, function(y) sum(length(which(is.na(y)))))
+na_count_test <-sapply(test_csv, function(y) sum(length(which(is.na(y)))))
+```
+
+```{r}
+na_count_train
+na_count_test
+```
+There's not an insignificant amount of missing values in the dataset, roughly 2-3% in most variables. We should see if there are any easy ways to impute missing values first before jumping into more complex methods, for example, do passengers in the same boarding groups (i.e. in the same Group_ID variable) have the same VIP status? How about other categorical variables? The below code block investigates this question.
+
+```{r}
+train_csv <- train_csv %>%
+  group_by(ID_Group) %>%
+  mutate(GroupSize = n()) %>%
+  ungroup()
+
+multi_passenger_groups <- train_csv %>%
+  filter(GroupSize > 1)
+
+# -- Function: check within-group consistency for any categorical variable ----
+check_group_consistency <- function(data, var) {
+  
+  var_sym <- sym(var)
+  
+  group_summary <- data %>%
+    group_by(ID_Group) %>%
+    summarise(
+      GroupSize      = first(GroupSize),
+      NMissing       = sum(is.na(!!var_sym)),
+      DistinctValues = n_distinct(na.omit(!!var_sym)),  
+      .groups = "drop"
+    )
+  
+  consistency_summary <- group_summary %>%
+    filter(DistinctValues > 0) %>%
+    count(DistinctValues) %>%
+    mutate(
+      Pct      = round(100 * n / sum(n), 1),
+      Variable = var
+    )
+  
+  cat("\n====", var, "====\n")
+  cat("Groups with all values missing:", sum(group_summary$DistinctValues == 0), "\n")
+  print(consistency_summary)
+  
+  p <- group_summary %>%
+    filter(DistinctValues > 0) %>%
+    mutate(Consistency = ifelse(DistinctValues == 1, "Consistent", "Mixed")) %>%
+    ggplot(aes(x = Consistency, fill = Consistency)) +
+    geom_bar() +
+    geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+    scale_fill_manual(values = c("Consistent" = "steelblue", "Mixed" = "tomato")) +
+    labs(
+      title = paste("Within Boarding Group Consistency:", var),
+      x     = "Consistency",
+      y     = "Number of Groups"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  print(p)
+  
+  invisible(list(group_summary = group_summary, consistency_summary = consistency_summary))
+}
+
+# -- Apply to variables of interest -------------------------------------------
+categorical_vars <- c("VIP", "CryoSleep", "HomePlanet", "Destination", "Cabin_Deck", "Cabin_Side")
+
+results <- map(categorical_vars, ~ check_group_consistency(multi_passenger_groups, .x))
+names(results) <- categorical_vars
+```
+From this we can see there's some grouping around VIP status, which side they were residing on (Cabin_Side), and HomePlanet, but no real consistency around other variables. Are there other variables we can move around? These boarding groups are 'often family members but not always' so will there be different results if we group around family members? 
+
+```{r}
+for(i in 1:nrow(train_csv)){
+  train_csv$First_Name[i] <- strsplit(train_csv$Name[i], split=' ')[[1]][1]
+  train_csv$Surname[i] <- strsplit(train_csv$Name[i], split = ' ')[[1]][2]}
+```
+
+```{r}
+train_csv <- train_csv %>%
+  group_by(Surname) %>%
+  mutate(FamilySize = n()) %>%
+  ungroup()
+
+multi_passenger_groups <- train_csv %>%
+  filter(FamilySize > 1)
+
+# -- Function: check within-group consistency for any categorical variable ----
+check_group_consistency <- function(data, var) {
+  
+  var_sym <- sym(var)
+  
+  group_summary <- data %>%
+    group_by(Surname) %>%
+    summarise(
+      FamilySize      = first(FamilySize),
+      NMissing       = sum(is.na(!!var_sym)),
+      DistinctValues = n_distinct(na.omit(!!var_sym)),  
+      .groups = "drop"
+    )
+  
+  consistency_summary <- group_summary %>%
+    filter(DistinctValues > 0) %>%
+    count(DistinctValues) %>%
+    mutate(
+      Pct      = round(100 * n / sum(n), 1),
+      Variable = var
+    )
+  
+  cat("\n====", var, "====\n")
+  cat("Groups with all values missing:", sum(group_summary$DistinctValues == 0), "\n")
+  print(consistency_summary)
+  
+  p <- group_summary %>%
+    filter(DistinctValues > 0) %>%
+    mutate(Consistency = ifelse(DistinctValues == 1, "Consistent", "Mixed")) %>%
+    ggplot(aes(x = Consistency, fill = Consistency)) +
+    geom_bar() +
+    geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+    scale_fill_manual(values = c("Consistent" = "steelblue", "Mixed" = "tomato")) +
+    labs(
+      title = paste("Within Family Group Consistency:", var),
+      x     = "Consistency",
+      y     = "Number of Groups"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  print(p)
+  
+  invisible(list(group_summary = group_summary, consistency_summary = consistency_summary))
+}
+
+# -- Apply to variables of interest -------------------------------------------
+categorical_vars <- c("VIP", "CryoSleep", "HomePlanet", "Destination", "Cabin_Deck", "Cabin_Side")
+
+results <- map(categorical_vars, ~ check_group_consistency(multi_passenger_groups, .x))
+names(results) <- categorical_vars
+```
+I don't think this approach works as well because surnames are not unique and there's a lot of overlap with different groups, but it's still good to have checked. So, we can impute some missing values in the VIP and HomePlanet variables.
+
+```{r}
+get_mode <- function(x) {
+  vals <- na.omit(x)
+  if (length(vals) == 0) return(NA)
+  names(sort(table(vals), decreasing = TRUE))[1]
+}
+
+impute_by_group <- function(data, var) {
+  
+  var_sym <- sym(var)
+  
+  # Convert empty strings to NA so all downstream logic works consistently
+  data <- data %>%
+    mutate(!!var_sym := na_if(!!var_sym, "Missing"))
+  
+  n_missing_before <- sum(is.na(data[[var]]))
+  cat("\n====", var, "====\n")
+  cat("Missing before imputation:", n_missing_before, "\n")
+  
+  group_modes <- data %>%
+    group_by(ID_Group) %>%
+    summarise(GroupMode = get_mode(!!var_sym), .groups = "drop")
+  
+  data <- data %>%
+    left_join(group_modes, by = "ID_Group") %>%
+    mutate(
+      !!var_sym := case_when(
+        is.na(!!var_sym) & !is.na(GroupMode) ~ GroupMode,
+        TRUE ~ as.character(!!var_sym)
+      )
+    ) %>%
+    select(-GroupMode)
+  
+  n_missing_after <- sum(is.na(data[[var]]))
+  cat("Missing after imputation: ", n_missing_after, "\n")
+  cat("Values imputed:           ", n_missing_before - n_missing_after, "\n")
+  
+  return(data)
+}
+
+vars_to_impute <- c("VIP", "HomePlanet")
+
+train_imputed <- reduce(vars_to_impute, impute_by_group, .init = multi_passenger_groups)
+
+train_imputed <- train_imputed %>%
+  mutate(
+    VIP       = as.factor(VIP),
+    HomePlanet = as.factor(HomePlanet)
+  )
+```
+
+```{r}
+train_updated <- train_csv %>%
+  rows_update(
+    train_imputed %>% select(PassengerId, all_of(vars_to_impute)),
+    by = "PassengerId"
+  )
+```
+
+That's about as good as we can do for free, now we'll have to impute far more generally and over a lot more information because there is missing information in all variables. This means classification for the categorical or factor variables and regression for the numeric variables. We're going to try a few different methods of regression, Ridge regression to perform something similar to automatic feature selection for us, linear regression as something of a baseline, and random forest regression because that usually performs best on this kind of data regardless. For classification, we're going to be using modal guessing as a baseline, decision trees, support vector machines, and a hidden markov model. 
+
+```{r}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(e1071)
+library(glmnet)
+library(rpart)
+library(class)
+
+set.seed(42)
+
+# -- Variables to benchmark ---------------------------------------------------
+numerical_vars    <- c("Age", "RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck")
+categorical_vars  <- c("HomePlanet", "CryoSleep", "Destination", "VIP")
+
+# -- Draw a small complete-case subset for benchmarking -----------------------
+# We need complete cases so we can artificially introduce missingness and
+# then measure how well each method recovers the true values
+benchmark_data <- train_updated %>%
+  select(all_of(c(numerical_vars, categorical_vars))) %>%
+  mutate(
+    VIP       = as.logical(VIP),
+    CryoSleep = as.logical(CryoSleep)
+  ) %>%
+  # Convert categoricals to factors
+  mutate(across(all_of(categorical_vars), as.factor)) %>%
+  # Keep only complete cases for a clean benchmark
+  drop_na() %>%
+  slice_sample(n = 500)
+
+cat("Benchmark subset size:", nrow(benchmark_data), "\n")
+
+# -- Helper: artificially mask ~20% of a column then try to recover it --------
+make_masked <- function(data, var, mask_frac = 0.2) {
+  n        <- nrow(data)
+  mask_idx <- sample(seq_len(n), size = floor(n * mask_frac))
+  masked   <- data
+  masked[[var]][mask_idx] <- NA
+  list(masked = masked, true_vals = data[[var]][mask_idx], mask_idx = mask_idx)
+}
+
+# -- Numerical benchmarking ---------------------------------------------------
+benchmark_numerical <- function(data, var) {
+  
+  cat("\n-- Numerical:", var, "--\n")
+  
+  prepared  <- make_masked(data, var)
+  masked    <- prepared$masked
+  true_vals <- prepared$true_vals
+  mask_idx  <- prepared$mask_idx
+  
+  # Predictors: all other numerical variables
+  other_num <- setdiff(numerical_vars, var)
+  train_df  <- masked[-mask_idx, c(other_num, var)] %>% drop_na()
+  test_df   <- masked[ mask_idx,  other_num]
+  
+  x_train <- as.matrix(train_df[, other_num])
+  y_train <- train_df[[var]]
+  x_test  <- as.matrix(test_df)
+  
+  results <- list()
+  
+  # Linear regression
+  lm_fit         <- lm(as.formula(paste(var, "~ .")), data = train_df)
+  lm_preds       <- predict(lm_fit, newdata = test_df)
+  results$Linear <- sqrt(mean((lm_preds - true_vals)^2))
+  
+  # Ridge regression
+  ridge_fit      <- cv.glmnet(x_train, y_train, alpha = 0)
+  ridge_preds    <- predict(ridge_fit, newx = x_test, s = "lambda.min")
+  results$Ridge  <- sqrt(mean((ridge_preds - true_vals)^2))
+  
+  # Random forest
+  rf_fit         <- randomForest(as.formula(paste(var, "~ .")), data = train_df, ntree = 100)
+  rf_preds       <- predict(rf_fit, newdata = test_df)
+  results$RandomForest <- sqrt(mean((rf_preds - true_vals)^2))
+  
+  # KNN (using caret for scaling + knn)
+  pre_proc    <- preProcess(train_df[, other_num], method = c("center", "scale"))
+  train_scaled <- predict(pre_proc, train_df[, other_num])
+  test_scaled  <- predict(pre_proc, test_df)
+  knn_preds    <- FNN::knn.reg(train = train_scaled, test = test_scaled,
+                                y = y_train, k = 5)$pred
+  results$KNN  <- sqrt(mean((knn_preds - true_vals)^2))
+  
+  tibble(Variable = var, Model = names(results), RMSE = unlist(results))
+}
+
+# -- Categorical benchmarking -------------------------------------------------
+benchmark_categorical <- function(data, var) {
+  
+  cat("\n-- Categorical:", var, "--\n")
+  
+  prepared  <- make_masked(data, var)
+  masked    <- prepared$masked
+  true_vals <- prepared$true_vals
+  mask_idx  <- prepared$mask_idx
+  
+  # Predictors: all other categorical + all numerical variables
+  other_vars <- setdiff(categorical_vars, var)
+  pred_vars  <- c(other_vars, numerical_vars)
+  
+  train_df <- masked[-mask_idx, c(pred_vars, var)] %>% drop_na()
+  test_df  <- masked[ mask_idx,  pred_vars]
+  
+  results <- list()
+  
+  # Mode baseline
+  mode_val        <- names(sort(table(train_df[[var]]), decreasing = TRUE))[1]
+  mode_preds      <- rep(mode_val, nrow(test_df))
+  results$Mode    <- mean(mode_preds != as.character(true_vals))
+  
+  # Decision tree
+  dt_fit          <- rpart(as.formula(paste(var, "~ .")), data = train_df, method = "class")
+  dt_preds        <- predict(dt_fit, newdata = test_df, type = "class")
+  results$DecisionTree <- mean(dt_preds != true_vals)
+  
+  # SVM
+  svm_fit         <- svm(as.formula(paste(var, "~ .")), data = train_df, kernel = "radial")
+  svm_preds       <- predict(svm_fit, newdata = test_df)
+  results$SVM     <- mean(svm_preds != true_vals)
+  
+  # KNN
+  # Encode factors as numeric for distance calculation
+  encode_factors <- function(df) {
+    df %>% mutate(across(where(is.factor), as.numeric))
+  }
+  train_encoded   <- encode_factors(train_df[, pred_vars])
+  test_encoded    <- encode_factors(test_df)
+  pre_proc        <- preProcess(train_encoded, method = c("center", "scale"))
+  train_scaled    <- predict(pre_proc, train_encoded)
+  test_scaled     <- predict(pre_proc, test_encoded)
+  knn_preds       <- knn(train = train_scaled, test = test_scaled,
+                          cl = train_df[[var]], k = 5)
+  results$KNN     <- mean(knn_preds != true_vals)
+  
+  # Random forest
+  rf_fit          <- randomForest(as.formula(paste(var, "~ .")), data = train_df, ntree = 100)
+  rf_preds        <- predict(rf_fit, newdata = test_df)
+  results$RandomForest <- mean(rf_preds != true_vals)
+  
+  tibble(Variable = var, Model = names(results), ErrorRate = unlist(results))
+}
+
+# -- Run benchmarks -----------------------------------------------------------
+numerical_results   <- map_dfr(numerical_vars,   ~ benchmark_numerical(benchmark_data, .x))
+categorical_results <- map_dfr(categorical_vars, ~ benchmark_categorical(benchmark_data, .x))
+
+# -- Display results ----------------------------------------------------------
+cat("\n\n=== Numerical Results (RMSE, lower is better) ===\n")
+numerical_results %>%
+  mutate(RMSE = round(RMSE, 3)) %>%
+  pivot_wider(names_from = Model, values_from = RMSE) %>%
+  print()
+
+cat("\n=== Categorical Results (Error Rate, lower is better) ===\n")
+categorical_results %>%
+  mutate(ErrorRate = round(ErrorRate, 3)) %>%
+  pivot_wider(names_from = Model, values_from = ErrorRate) %>%
+  print()
+
+# -- Visualise ----------------------------------------------------------------
+numerical_results %>%
+  ggplot(aes(x = Model, y = RMSE, fill = Model)) +
+  geom_col() +
+  facet_wrap(~ Variable, scales = "free_y") +
+  labs(title = "Numerical Imputation: RMSE by Model and Variable") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+categorical_results %>%
+  ggplot(aes(x = Model, y = ErrorRate, fill = Model)) +
+  geom_col() +
+  facet_wrap(~ Variable, scales = "free_y") +
+  labs(title = "Categorical Imputation: Error Rate by Model and Variable") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+```
+
+These benchmarks show that the predictive methods work well enough for the categorical variables, often returning low error rates of predictions. However, the numerical methods really don't work well for predictive accuracy at all, and this is largely because of the distribution of values within these variables (~64% of passengers spent nothing in one or more of the numerical categories)
+
+```{r}
+benchmark_numerical <- function(data, var) {
+  
+  cat("\n-- Numerical:", var, "--\n")
+  
+  prepared  <- make_masked(data, var)
+  masked    <- prepared$masked
+  true_vals <- prepared$true_vals
+  mask_idx  <- prepared$mask_idx
+  
+  other_num <- setdiff(numerical_vars, var)
+  pred_vars <- c(other_num, categorical_vars)
+  
+  train_df  <- masked[-mask_idx, c(pred_vars, var)] %>% drop_na()
+  test_df   <- masked[ mask_idx,  pred_vars]
+  
+  # -- Consistent encoding: all categoricals to numeric everywhere ------------
+  encode <- function(df) {
+    df %>% mutate(across(all_of(categorical_vars), ~ as.numeric(as.factor(.x))))
+  }
+  
+  train_enc <- encode(train_df[, pred_vars])
+  test_enc  <- encode(test_df)
+  y_train   <- train_df[[var]]
+  
+  # -- Log-transformed versions (numerics only, not encoded categoricals) -----
+  log_num <- function(df) {
+    df %>% mutate(across(all_of(other_num), log1p))
+  }
+  
+  train_enc_log <- log_num(train_enc)
+  test_enc_log  <- log_num(test_enc)
+  y_train_log   <- log1p(y_train)
+  
+  x_train     <- as.matrix(train_enc)
+  x_test      <- as.matrix(test_enc)
+  x_train_log <- as.matrix(train_enc_log)
+  x_test_log  <- as.matrix(test_enc_log)
+  
+  results <- list()
+  
+  # -- Untransformed models ---------------------------------------------------
+  
+  # Linear
+  lm_fit         <- lm(as.formula(paste(var, "~ .")),
+                       data = bind_cols(train_enc, !!sym(var) := y_train))
+  results$Linear <- sqrt(mean((predict(lm_fit, newdata = test_enc) - true_vals)^2))
+  
+  # Ridge
+  ridge_fit      <- cv.glmnet(x_train, y_train, alpha = 0)
+  results$Ridge  <- sqrt(mean((
+    as.vector(predict(ridge_fit, newx = x_test, s = "lambda.min")) - true_vals)^2))
+  
+  # Random forest
+  rf_train_df          <- bind_cols(train_enc, !!sym(var) := y_train)
+  rf_fit               <- randomForest(as.formula(paste(var, "~ .")),
+                                       data = rf_train_df, ntree = 100)
+  results$RandomForest <- sqrt(mean((predict(rf_fit, newdata = test_enc) - true_vals)^2))
+  
+  # KNN
+  pre_proc     <- preProcess(train_enc, method = c("center", "scale"))
+  train_scaled <- predict(pre_proc, train_enc)
+  test_scaled  <- predict(pre_proc, test_enc)
+  results$KNN  <- sqrt(mean((
+    FNN::knn.reg(train_scaled, test_scaled, y = y_train, k = 3)$pred - true_vals)^2))
+  
+  # -- Log-transformed models -------------------------------------------------
+  
+  # Linear (log)
+  lm_log_fit         <- lm(as.formula(paste(var, "~ .")),
+                            data = bind_cols(train_enc_log, !!sym(var) := y_train_log))
+  results$Linear_log <- sqrt(mean((
+    expm1(predict(lm_log_fit, newdata = test_enc_log)) - true_vals)^2))
+  
+  # Ridge (log)
+  ridge_log_fit      <- cv.glmnet(x_train_log, y_train_log, alpha = 0)
+  results$Ridge_log  <- sqrt(mean((
+    expm1(as.vector(predict(ridge_log_fit, newx = x_test_log, s = "lambda.min"))) - true_vals)^2))
+  
+  # Random forest (log)
+  rf_log_train_df        <- bind_cols(train_enc_log, !!sym(var) := y_train_log)
+  rf_log_fit             <- randomForest(as.formula(paste(var, "~ .")),
+                                         data = rf_log_train_df, ntree = 100)
+  results$RandomForest_log <- sqrt(mean((
+    expm1(predict(rf_log_fit, newdata = test_enc_log)) - true_vals)^2))
+  
+  # KNN (log)
+  pre_proc_log     <- preProcess(train_enc_log, method = c("center", "scale"))
+  train_scaled_log <- predict(pre_proc_log, train_enc_log)
+  test_scaled_log  <- predict(pre_proc_log, test_enc_log)
+  results$KNN_log  <- sqrt(mean((
+    expm1(FNN::knn.reg(train_scaled_log, test_scaled_log,
+                       y = y_train_log, k = 3)$pred) - true_vals)^2))
+  
+  # -- Zero-inflated model ----------------------------------------------------
+  # Step 1: classify zero vs non-zero
+  zi_train_df <- bind_cols(train_enc, !!sym(var) := y_train) %>%
+    mutate(IsNonZero = as.factor(get(var) > 0))
+  
+  zi_fit       <- randomForest(
+    as.formula(paste("IsNonZero ~", paste(pred_vars, collapse = "+"))),
+    data  = zi_train_df,
+    ntree = 100
+  )
+  prob_nonzero <- predict(zi_fit, newdata = test_enc, type = "prob")[, "TRUE"]
+  
+  # Step 2: regress on positive values only in log space
+  train_pos <- bind_cols(train_enc_log, !!sym(var) := y_train_log) %>%
+    filter(get(var) > 0)
+  
+  if (nrow(train_pos) >= 10) {
+    rf_pos    <- randomForest(as.formula(paste(var, "~ .")),
+                              data = train_pos, ntree = 100)
+    preds_pos <- expm1(predict(rf_pos, newdata = test_enc_log))
+  } else {
+    preds_pos <- rep(0, nrow(test_enc))
+  }
+  
+  # Step 3: combine
+  zi_preds             <- prob_nonzero * preds_pos
+  results$ZeroInflated <- sqrt(mean((zi_preds - true_vals)^2))
+  
+  tibble(Variable = var, Model = names(results), RMSE = unlist(results))
+}
+
+# -- Run and display ----------------------------------------------------------
+numerical_results <- map_dfr(numerical_vars, ~ benchmark_numerical(benchmark_data, .x))
+
+cat("\n=== Numerical Results (RMSE, lower is better) ===\n")
+numerical_results %>%
+  mutate(RMSE = round(RMSE, 3)) %>%
+  pivot_wider(names_from = Model, values_from = RMSE) %>%
+  print()
+
+numerical_results %>%
+  mutate(
+    Transformed = ifelse(str_detect(Model, "_log"), "Log Transformed",
+                  ifelse(Model == "ZeroInflated", "Zero Inflated", "Untransformed")),
+    Model = str_remove(Model, "_log")
+  ) %>%
+  ggplot(aes(x = Model, y = RMSE, fill = Transformed)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ Variable, scales = "free_y") +
+  labs(title = "Numerical Imputation: RMSE by Model, Variable, and Transformation",
+       x = "Model", y = "RMSE", fill = "Approach") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
